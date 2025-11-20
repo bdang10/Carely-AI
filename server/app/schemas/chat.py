@@ -15,4 +15,5 @@ class ChatMessageResponse(BaseModel):
     message_id: str | None = Field(None, description="Optional message ID for tracking")
     conversation_id: str = Field(..., description="Conversation ID for this message")
     appointment_data: Optional[Dict[str, Any]] = Field(None, description="Appointment booking data if applicable")
+    routing_decision: Optional[Dict[str, Any]] = Field(None, description="Router metadata for the message")
 
