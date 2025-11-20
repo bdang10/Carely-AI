@@ -13,6 +13,8 @@ from app.models.chat_conversation import ChatConversation
 from app.models.chat_message import ChatMessage
 from app.models.appointment import Appointment
 from app.agents.appointment_agent import AppointmentAgent
+from app.agents.qna_agent import QnaAgent
+from app.agents.routing_agent import RoutingAgent
 
 router = APIRouter()
 
@@ -41,9 +43,13 @@ Remember: You are an assistant that provides information and guidance, but not m
 # Initialize OpenAI client and Appointment Agent
 openai_client = None
 appointment_agent = None
+routing_agent = None
+qna_agent = None
 if settings.OPENAI_API_KEY:
     openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
     appointment_agent = AppointmentAgent(openai_client)
+    routing_agent = RoutingAgent(openai_client)
+    qna_agent = QnaAgent(openai_client)
 
 
 @router.post("/", response_model=ChatMessageResponse, status_code=status.HTTP_200_OK)
@@ -116,14 +122,14 @@ async def chat(
                 "content": msg.content
             })
         
-        # Check if this is an appointment-related request
-        appointment_intent = appointment_agent.detect_appointment_intent(user_message) if appointment_agent else None
+        routing_decision = routing_agent.route_decision(user_message) if routing_agent else None
+        target_service = routing_decision.get("next_service") if routing_decision else None
         
         ai_response = ""
         appointment_data = None
         
-        if appointment_intent:
-            # Use appointment agent to handle the request
+        if target_service == "appointment_service" and appointment_agent:
+            appointment_intent = appointment_agent.detect_appointment_intent(user_message)
             ai_response, appointment_data = await appointment_agent.process_appointment_request(
                 message=user_message,
                 conversation_history=conversation_history,
@@ -131,20 +137,23 @@ async def chat(
                 db=db,
                 intent=appointment_intent
             )
+        elif target_service == "qna_service" and qna_agent:
+            ai_response = qna_agent.generate_response(
+                user_message=user_message,
+                conversation_history=conversation_history
+            )
         else:
-            # Use general medical assistant
+            # Use general medical assistant fallback
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(conversation_history)
             messages.append({"role": "user", "content": user_message})
             
-            # Call OpenAI API
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
                 temperature=0.7,
                 max_tokens=1000
             )
-            
             ai_response = response.choices[0].message.content.strip()
         
         # Generate message IDs for tracking
@@ -184,6 +193,9 @@ async def chat(
         # Add appointment data if present
         if appointment_data:
             response_data.appointment_data = appointment_data
+        
+        if routing_decision:
+            response_data.routing_decision = routing_decision
         
         return response_data
     
