@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = Field(default=None)
     ANTHROPIC_API_KEY: Optional[str] = Field(default=None)
     
+    # RAG Configuration
+    PINECONE_API_KEY: Optional[str] = Field(default=None)
+    RAG_ENABLED: bool = Field(default=False, description="Enable RAG for enhanced QnA responses")
+    
     # Healthcare specific
     MAX_APPOINTMENT_DAYS_AHEAD: int = 90
     SUPPORT_EMAIL: str = "support@carely-ai.com"

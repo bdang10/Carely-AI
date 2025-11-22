@@ -1,6 +1,7 @@
 """
 AI Agent for handling appointment scheduling through natural conversation.
 This agent extracts appointment details, suggests available slots, and completes bookings.
+Receives doctor and schedule information from the Routing Agent (which coordinates with QnA Agent).
 """
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -15,36 +16,98 @@ from app.models.patient import Patient
 
 
 class AppointmentAgent:
-    """AI Agent that handles appointment scheduling requests"""
-    
-    # Appointment types available
-    APPOINTMENT_TYPES = [
-        "consultation",
-        "follow-up",
-        "check-up",
-        "emergency",
-        "vaccination",
-        "lab_test",
-        "physical_exam",
-        "specialist_visit"
-    ]
-    
-    # Available doctors (in a real system, this would come from a database)
-    DOCTORS = [
-        {"name": "Dr. Sarah Johnson", "specialty": "General Practice", "id": "dr_johnson"},
-        {"name": "Dr. Michael Chen", "specialty": "Cardiology", "id": "dr_chen"},
-        {"name": "Dr. Emily Rodriguez", "specialty": "Pediatrics", "id": "dr_rodriguez"},
-        {"name": "Dr. James Williams", "specialty": "Orthopedics", "id": "dr_williams"},
-        {"name": "Dr. Lisa Anderson", "specialty": "Dermatology", "id": "dr_anderson"}
-    ]
+    """AI Agent that handles appointment scheduling requests with context from Routing Agent"""
     
     def __init__(self, openai_client: OpenAI):
         self.client = openai_client
         self.system_prompt = self._build_system_prompt()
     
+    def _build_system_prompt_with_context(self, doctor_info: str = None, schedule_info: str = None) -> str:
+        """Build system prompt with doctor and schedule context from Routing Agent"""
+        base_prompt = """You are an intelligent appointment management agent for Carely Healthcare.
+
+⚠️ IMPORTANT: Each appointment booking is INDEPENDENT. Do NOT assume the user wants the same doctor as previous appointments unless explicitly stated.
+
+Your responsibilities:
+1. **For NEW appointment requests**: ALWAYS ask which doctor they want, even if they've booked before
+2. **Show available doctors** from the knowledge base provided below
+3. **Confirm all details**: doctor name, date, time, reason
+4. **Use function calling** to book appointments (required!)
+
+CRITICAL RULES:
+- DO NOT default to previously mentioned doctors
+- ALWAYS let user choose their doctor for each new appointment
+- If user doesn't specify a doctor, list available options
+- Each appointment is a fresh request
+
+BOOKING WORKFLOW:
+1. User: "I need an appointment"
+2. You: "I can help! What type of doctor do you need? We have [list from knowledge base]"
+3. User: Specifies doctor/specialty
+4. You: "Great! When would you like to see [doctor]?"
+5. User: Provides date/time
+6. You: Call book_appointment function with details
+
+EXAMPLE CONVERSATION:
+User: "I need another appointment"
+You: "Of course! What type of doctor do you need to see? We have cardiologists, primary care doctors, surgeons, and many other specialists available."
+
+User: "I need a cardiologist" 
+You: "We have these cardiologists available:
+- Dr. Benjamin Wu
+- Dr. Anthony Ea
+Which would you prefer?"
+
+**For showing available slots**:
+{{
+  "action": "show_slots",
+  "slot_request": {{
+    "start_date": "2024-11-10",
+    "days_ahead": 7,
+    "doctor_name": "Dr. Sarah Johnson"
+  }}
+}}
+
+**For listing appointments**:
+{{
+  "action": "list_appointments",
+  "filters": {{}}
+}}
+
+**For canceling appointments**:
+{{
+  "action": "cancel_appointment",
+  "appointment_id": 123
+}}
+"""
+        
+        # Add doctor information if provided by Routing Agent
+        if doctor_info:
+            base_prompt += f"\n\n**Doctor Information (from Knowledge Base):**\n{doctor_info}\n"
+        
+        # Add schedule information if provided by Routing Agent
+        if schedule_info and schedule_info != "Available through doctor information above":
+            base_prompt += f"\n\n**Schedule Information:**\n{schedule_info}\n"
+        
+        base_prompt += """
+Conversation style:
+- Be warm, empathetic, and professional
+- Use clear, simple language
+- Confirm understanding of user requests
+- Provide helpful suggestions
+- Maintain HIPAA-compliant privacy
+
+Remember: 
+- Always include the JSON action when performing operations
+- For new bookings, you MUST include the JSON or the appointment will NOT be created
+- Confirm all details before booking
+"""
+        
+        return base_prompt
+    
     def _build_system_prompt(self) -> str:
-        """Build the system prompt for the appointment agent"""
-        return f"""You are an intelligent appointment management agent for Carely Healthcare.
+        """Build a basic system prompt for the appointment agent"""
+        return """You are an intelligent appointment management agent for Carely Healthcare.
 
 Your capabilities:
 1. **Book appointments** - Schedule new appointments with doctors
@@ -53,10 +116,8 @@ Your capabilities:
 4. **Update/Reschedule appointments** - Modify appointment times and details
 5. **Show available slots** - Display available time slots
 
-Available appointment types: {', '.join(self.APPOINTMENT_TYPES)}
-
-Available doctors:
-{self._format_doctors_list()}
+Note: Doctor information and schedules will be provided dynamically from the knowledge base when needed.
+If you need more information about doctors or their schedules, you can query the knowledge base.
 
 Guidelines:
 - Be conversational, friendly, and helpful
@@ -68,18 +129,30 @@ Guidelines:
 - Remind users they can choose in-person or virtual appointments
 - Users can reference appointments by their ID number (e.g., "appointment #5")
 
-**For booking new appointments**, when you have enough information, respond with JSON:
+**CRITICAL: For booking new appointments**, when you have ALL required information (doctor, date/time, reason), 
+you MUST include the JSON object in your response. The appointment will ONLY be created if you include this JSON.
+Do NOT say the appointment is booked unless you include the JSON below:
+
 {{
   "action": "book_appointment",
   "appointment_details": {{
     "appointment_type": "consultation",
-    "doctor_name": "Dr. Sarah Johnson",
-    "scheduled_time": "2024-11-10T14:00:00",
-    "reason": "Annual check-up",
+    "doctor_name": "Dr. James Williams",
+    "scheduled_time": "2024-11-22T10:00:00",
+    "reason": "Shoulder issue",
     "is_virtual": false,
     "duration_minutes": 30
   }}
 }}
+
+Example good response when booking:
+"I'll book that appointment for you now.
+
+{{"action": "book_appointment", "appointment_details": {{"appointment_type": "consultation", "doctor_name": "Dr. James Williams", "scheduled_time": "2024-11-22T10:00:00", "reason": "Shoulder issue", "is_virtual": false, "duration_minutes": 30}}}}
+
+Your appointment is being scheduled!"
+
+**OLD FORMAT (DO NOT USE):**
 
 **For showing available slots**:
 {{
@@ -100,10 +173,6 @@ Note: List and cancel operations are handled directly without AI processing.
 
 Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-    
-    def _format_doctors_list(self) -> str:
-        """Format doctors list for system prompt"""
-        return '\n'.join([f"- {doc['name']} ({doc['specialty']})" for doc in self.DOCTORS])
     
     def detect_appointment_intent(self, message: str) -> str:
         """
@@ -145,14 +214,16 @@ Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         
         return None
     
+    
     def generate_available_slots(
         self, 
         start_date: Optional[datetime] = None,
-        days_ahead: int = 7
+        days_ahead: int = 7,
+        doctor_name: str = None
     ) -> List[Dict]:
         """
         Generate available appointment slots.
-        In a real system, this would check actual doctor availability.
+        First tries to get schedule from RAG, falls back to default schedule.
         """
         if start_date is None:
             start_date = datetime.now()
@@ -160,9 +231,14 @@ Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         # Remove time component
         start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
         
+        # Note: Schedule information is provided via context from Routing Agent
+        # In a production system, parse the context to generate slots based on actual availability
+        print(f"📅 Generating generic slots for {doctor_name or 'all doctors'}")
+        
         slots = []
         
         # Generate slots for next N days (weekdays only, 9 AM - 5 PM)
+        # In a production system, this would be based on actual doctor schedules from RAG
         for day_offset in range(days_ahead):
             current_date = start_date + timedelta(days=day_offset)
             
@@ -182,7 +258,8 @@ Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     slots.append({
                         "datetime": slot_time.isoformat(),
                         "formatted": slot_time.strftime("%A, %B %d at %I:%M %p"),
-                        "available": True
+                        "available": True,
+                        "doctor": doctor_name if doctor_name else "Any available doctor"
                     })
         
         return slots[:20]  # Return first 20 available slots
@@ -435,10 +512,12 @@ Appointment #{appointment.id} has been successfully updated.
         conversation_history: List[Dict],
         patient_id: int,
         db: Session,
-        intent: str = None
+        intent: str = None,
+        context: Optional[Dict[str, str]] = None
     ) -> Tuple[str, Optional[Dict]]:
         """
         Process an appointment-related message.
+        Receives context (doctor info, schedules) from Routing Agent.
         Returns (AI response, appointment_data)
         """
         # Handle direct operations (list, cancel specific appointment)
@@ -452,30 +531,154 @@ Appointment #{appointment.id} has been successfully updated.
             appointment_id = int(appointment_id_match.group(1))
             return self.cancel_appointment(patient_id, appointment_id, db)
         
+        # Build system prompt with context from Routing Agent
+        doctor_info = context.get("doctor_info") if context else None
+        schedule_info = context.get("schedule_info") if context else None
+        
+        print(f"📋 Appointment Agent: Received context: {context is not None}")
+        if context:
+            print(f"   Context keys: {list(context.keys())}")
+            if doctor_info:
+                print(f"   Doctor info length: {len(doctor_info)} characters")
+                print(f"   Doctor info preview: {doctor_info[:200]}...")
+        
+        system_prompt_with_context = self._build_system_prompt_with_context(doctor_info, schedule_info)
+        
+        print(f"📝 System prompt length: {len(system_prompt_with_context)} characters")
+        print(f"   Contains doctor info: {'Doctor Information' in system_prompt_with_context}")
+        
         # Build messages for OpenAI
         messages = [
-            {"role": "system", "content": self.system_prompt}
+            {"role": "system", "content": system_prompt_with_context}
         ]
         
-        # Add conversation history
-        messages.extend(conversation_history)
+        # Filter conversation history to prevent defaulting to previous doctors
+        # Detect if this is a new appointment request (not continuing previous conversation)
+        new_appointment_keywords = ['another appointment', 'new appointment', 'different doctor', 
+                                     'see a different', 'book another', 'schedule another',
+                                     'need to see', 'want to see', 'appointment for']
+        
+        is_new_request = any(keyword in message.lower() for keyword in new_appointment_keywords)
+        
+        if is_new_request:
+            # Limit history to avoid bias toward previous doctor
+            # Only include last 2 exchanges (4 messages) to maintain context
+            limited_history = conversation_history[-4:] if len(conversation_history) > 4 else conversation_history
+            print(f"   📌 New appointment detected - limiting history to last {len(limited_history)} messages")
+            messages.extend(limited_history)
+        else:
+            # Normal flow - include all history
+            messages.extend(conversation_history)
         
         # Add current message
         messages.append({"role": "user", "content": message})
         
         try:
-            # Call OpenAI API
+            # Define function for booking appointments
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "book_appointment",
+                        "description": "Book a NEW medical appointment. User must specify which doctor they want for THIS appointment - do not assume they want the same doctor as previous bookings.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "doctor_name": {
+                                    "type": "string",
+                                    "description": "Full name of the doctor (e.g. 'Dr. Michael Chen')"
+                                },
+                                "scheduled_time": {
+                                    "type": "string",
+                                    "description": "Appointment date and time in ISO format (e.g. '2024-11-22T10:00:00')"
+                                },
+                                "reason": {
+                                    "type": "string",
+                                    "description": "Reason for the appointment"
+                                },
+                                "appointment_type": {
+                                    "type": "string",
+                                    "enum": ["consultation", "follow-up", "emergency", "check-up"],
+                                    "description": "Type of appointment"
+                                },
+                                "is_virtual": {
+                                    "type": "boolean",
+                                    "description": "Whether this is a virtual appointment"
+                                },
+                                "duration_minutes": {
+                                    "type": "integer",
+                                    "description": "Duration in minutes (default 30)"
+                                }
+                            },
+                            "required": ["doctor_name", "scheduled_time", "reason"]
+                        }
+                    }
+                }
+            ]
+            
+            # Call OpenAI API with function calling
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
-                temperature=0.7,
+                tools=tools,
+                tool_choice="auto",  # Let the model decide when to call the function
+                temperature=0.3,
                 max_tokens=1000
             )
             
-            ai_response = response.choices[0].message.content.strip()
+            message = response.choices[0].message
+            ai_response = message.content.strip() if message.content else ""
+            appointment_data = None
             
-            # Extract appointment details if present
-            appointment_data = self.extract_appointment_details(ai_response)
+            print(f"\n📝 AI Response:")
+            print(f"   Has content: {bool(ai_response)}")
+            print(f"   Has tool_calls: {bool(message.tool_calls)}")
+            
+            # Check if AI used function calling (preferred method)
+            if message.tool_calls:
+                tool_call = message.tool_calls[0]
+                if tool_call.function.name == "book_appointment":
+                    print(f"✅ AI used function calling to book appointment!")
+                    
+                    # Parse function arguments
+                    function_args = json.loads(tool_call.function.arguments)
+                    print(f"   Function args: {function_args}")
+                    
+                    # Convert to our appointment_data format
+                    appointment_data = {
+                        "action": "book_appointment",
+                        "appointment_details": {
+                            "doctor_name": function_args.get("doctor_name"),
+                            "scheduled_time": function_args.get("scheduled_time"),
+                            "reason": function_args.get("reason"),
+                            "appointment_type": function_args.get("appointment_type", "consultation"),
+                            "is_virtual": function_args.get("is_virtual", False),
+                            "duration_minutes": function_args.get("duration_minutes", 30)
+                        }
+                    }
+                    
+                    # Generate friendly response if AI didn't provide one
+                    if not ai_response:
+                        ai_response = f"Perfect! Booking your appointment with {function_args.get('doctor_name')}..."
+            
+            # Fallback: Try to extract JSON from text response
+            if not appointment_data and ai_response:
+                print(f"   Trying to extract JSON from text...")
+                print(f"   Length: {len(ai_response)} characters")
+                print(f"   Preview: {ai_response[:500]}...")
+                print(f"   Contains JSON: {'{' in ai_response and '}' in ai_response}")
+                
+                appointment_data = self.extract_appointment_details(ai_response)
+                print(f"   Extracted data from text: {appointment_data is not None}")
+                if appointment_data:
+                    print(f"   Action: {appointment_data.get('action')}")
+                else:
+                    # Check if AI is claiming to book without providing data
+                    booking_keywords = ['booked', 'scheduled', 'appointment has been', 'confirmed your appointment']
+                    if any(keyword in ai_response.lower() for keyword in booking_keywords):
+                        print(f"⚠️  WARNING: AI claims booking but no data found!")
+                        print(f"   This appointment will NOT be created in the database")
+                        ai_response += "\n\n⚠️ Note: To complete the booking, please confirm all details."
             
             # If booking appointment, create it in the database
             if appointment_data and appointment_data.get('action') == 'book_appointment':

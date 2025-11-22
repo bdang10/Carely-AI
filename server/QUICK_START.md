@@ -1,165 +1,262 @@
-# 🚀 Carely Backend - Quick Start Guide
+# Quick Start Guide
 
-## ⚡ Fastest Way to Test
+## ✅ Architecture
 
-### Option 1: Run Helper Scripts (Easiest!)
+The system uses a **Routing Agent as Coordinator** architecture:
 
-**Run Tests:**
-```bash
-./run_tests.sh
+```
+User → Routing Agent (Coordinator)
+           ├─→ QnA Agent (with RAG) → Knowledge Base
+           └─→ Appointment Agent (receives context)
 ```
 
-**Start Server:**
-```bash
-./run_server.sh
-```
-Then visit: **http://localhost:8000/docs**
+**Key Point:** The Routing Agent coordinates information flow. It queries the QnA Agent (which has RAG) and passes that information to the Appointment Agent.
 
 ---
 
-## 🐍 Manual Testing
+## 🚀 How to Run
 
-### From Terminal:
+### 1. Start the Server
+
 ```bash
-cd /Users/arvindrangarajan/PythonLab/Carely/backend
-source venv/bin/activate
-python quick_test.py
+cd /Users/arvindrangarajan/PythonLab/Carely-AI/server
+bash run_server.sh
 ```
 
-### Start Server:
+**Expected logs:**
+```
+✅ QnA agent initialized with RAG
+✅ Routing agent initialized with QnA agent  
+✅ Appointment agent initialized
+INFO:     Uvicorn running on http://0.0.0.0:8000
+```
+
+### 2. Start the Client
+
 ```bash
-cd /Users/arvindrangarajan/PythonLab/Carely/backend
-source venv/bin/activate
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+cd /Users/arvindrangarajan/PythonLab/Carely-AI/client
+npm run dev
+```
+
+**Expected output:**
+```
+VITE v5.x.x  ready in XXX ms
+➜  Local:   http://localhost:5173/
+```
+
+### 3. Test the System
+
+Open browser to `http://localhost:5173`
+
+**Test 1: Q&A (uses RAG directly)**
+```
+You: "What services does the hospital provide?"
+AI: [Response using RAG knowledge base]
+```
+
+**Test 2: Appointment (uses RAG via Routing Agent)**
+```
+You: "I need to see a cardiologist"
+
+System logs should show:
+🔄 Getting appointment context from Routing Agent...
+🔄 Routing Agent: Requesting doctor information from QnA Agent...
+✅ Routing Agent: Received doctor information from QnA Agent
+✅ Context received: ['doctor_info', 'schedule_info']
+
+AI: "We have these cardiologists available:
+- Dr. Michael Chen (Mon-Fri 9AM-5PM)  
+- Dr. Sarah Williams (Tue-Sat 8AM-4PM)
+Which would you prefer?"
+```
+
+**Test 3: Book Appointment**
+```
+You: "Book with Dr. Chen tomorrow at 10am for a heart checkup"
+
+AI: [Books appointment using real doctor information from RAG]
 ```
 
 ---
 
-## 🎯 Running from Cursor/VS Code
+## 🔧 Configuration
 
-### Issue: "ModuleNotFoundError: No module named 'app'"
+### Required Environment Variables
 
-**Solution:** Don't click the Run button on individual files. Instead:
+**In `/Users/arvindrangarajan/PythonLab/Carely-AI/server/.env`:**
 
-### Method 1: Use Debug Configurations
-1. Go to the **Run and Debug** panel (left sidebar)
-2. Select from dropdown:
-   - **"Python: Quick Test"** - Run tests
-   - **"Python: FastAPI"** - Start server
-3. Click the green play button ▶️
+```bash
+# OpenAI API Key (required)
+OPENAI_API_KEY=sk-your-key-here
 
-### Method 2: Use Integrated Terminal
-1. Open terminal in Cursor (`` Ctrl + ` ``)
-2. Run:
-   ```bash
-   cd Carely/backend
-   source venv/bin/activate
-   python quick_test.py
+# RAG Configuration (required for knowledge base)
+RAG_ENABLED=true
+PINECONE_API_KEY=your-pinecone-key-here
+
+# Database
+DATABASE_URL=sqlite:///./carely.db
+
+# JWT
+SECRET_KEY=your-secret-key-here
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+```
+
+### Enable/Disable RAG
+
+**To enable RAG (recommended):**
+```bash
+RAG_ENABLED=true
+```
+
+**To disable RAG (fallback mode):**
+```bash
+RAG_ENABLED=false
+```
+
+---
+
+## 🏗️ How It Works
+
+### Information Flow for Appointments:
+
+1. **User asks for appointment**
+   ```
+   "I need to see a cardiologist"
    ```
 
-### Method 3: Change Python Interpreter
-1. Press **`Cmd + Shift + P`**
-2. Type: **`Python: Select Interpreter`**
-3. Choose: **`./Carely/backend/venv/bin/python`**
-4. Look at bottom-right corner to verify it changed
+2. **Routing Agent classifies intent**
+   ```
+   → "appointment_service"
+   ```
+
+3. **Routing Agent queries QnA Agent**
+   ```python
+   context = routing_agent.get_appointment_context()
+   # QnA Agent uses RAG to get doctor information
+   ```
+
+4. **Routing Agent provides context to Appointment Agent**
+   ```python
+   appointment_agent.process_appointment_request(
+       ...,
+       context=context  # Doctor info from RAG
+   )
+   ```
+
+5. **Appointment Agent uses context**
+   ```
+   - Builds system prompt with doctor information
+   - AI responds with real doctor names and schedules
+   - Books appointment with accurate information
+   ```
 
 ---
 
-## ✅ Test Results
+## 🧪 Debugging
 
-When tests run successfully, you'll see:
+### Check Server Logs
+
+When you make an appointment request, you should see:
 
 ```
-============================================================
-🏥 Carely AI Backend - Quick Test
-============================================================
+🔄 Getting appointment context from Routing Agent...
+🔄 Routing Agent: Requesting doctor information from QnA Agent...
+✅ Routing Agent: Received doctor information from QnA Agent
+✅ Context received: ['doctor_info', 'schedule_info']
+```
 
-1. Testing Health Endpoint...
-   ✅ Health check passed!
+If you don't see these logs:
+- ❌ RAG may not be enabled (check `RAG_ENABLED=true` in `.env`)
+- ❌ Routing Agent may not have QnA Agent
+- ❌ Check for errors in server startup
 
-2. Testing Root Endpoint...
-   ✅ Root endpoint works!
+### Verify Architecture
 
-3. Testing Patient Registration...
-   ✅ Patient registered successfully!
-   (or ⚠️ Patient already exists)
+```python
+# In Python console:
+from openai import OpenAI
+from app.core.config import settings
+from app.agents.qna_agent import QnaAgent
+from app.agents.routing_agent import RoutingAgent
+from app.agents.appointment_agent import AppointmentAgent
 
-4. Testing Login...
-   ✅ Login successful!
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
-5. Testing Protected Endpoint...
-   ✅ Authorization works!
+qna = QnaAgent(client, use_rag=True)
+routing = RoutingAgent(client, qna_agent=qna)
+appointment = AppointmentAgent(client)
 
-6. Testing Appointment Creation...
-   ✅ Appointment created!
-
-7. Testing Support Ticket Creation...
-   ✅ Support ticket created!
-
-============================================================
-✨ Testing Complete!
-============================================================
+print(f"✓ QnA has RAG: {qna.rag_instance is not None}")
+print(f"✓ Routing has QnA: {routing.qna_agent is not None}")
+print(f"✓ Appointment standalone: {not hasattr(appointment, 'qna_agent')}")
 ```
 
 ---
 
-## 🌐 Interactive API Testing
+## 📚 Documentation
 
-After starting the server:
-
-- **Swagger UI:** http://localhost:8000/docs
-- **ReDoc:** http://localhost:8000/redoc
-- **API Root:** http://localhost:8000
-
-### Quick Test in Browser:
-1. Visit http://localhost:8000/docs
-2. Try the **GET /api/v1/health/** endpoint
-3. Click "Try it out" → "Execute"
-4. You should see a healthy status response! ✅
+- **`FINAL_ARCHITECTURE.md`** - Complete architecture overview
+- **`ROUTING_AGENT_COORDINATOR.md`** - Detailed coordination flow
+- **`HOW_TO_USE_RAG.md`** - RAG setup and usage
+- **`API_KEY_AUDIT.md`** - API key configuration
 
 ---
 
-## 🔧 Troubleshooting
+## ✅ What to Expect
 
-### "ModuleNotFoundError: No module named 'fastapi'"
-**Solution:** Activate the virtual environment first!
-```bash
-source venv/bin/activate
-```
+### When RAG is Enabled:
 
-### "ModuleNotFoundError: No module named 'app'"
-**Solution:** Run from the backend directory:
-```bash
-cd /Users/arvindrangarajan/PythonLab/Carely/backend
-```
+**Q&A Queries:**
+- ✅ Accurate answers from knowledge base
+- ✅ Responses include hospital-specific information
+- ✅ Citations from documents
 
-### "Extra inputs are not permitted" (Google API keys)
-**Solution:** Already fixed! The config now ignores extra env vars.
+**Appointment Queries:**
+- ✅ Real doctor names and specialties
+- ✅ Accurate schedules
+- ✅ Hospital-specific appointment information
+- ✅ Coordinated through Routing Agent
 
-### Cursor using wrong Python interpreter
-**Solution:** 
-1. Bottom-right corner → Click Python version
-2. Select: `./Carely/backend/venv/bin/python`
+### When RAG is Disabled:
 
----
+**Q&A Queries:**
+- ⚠️  Generic responses from OpenAI
+- ⚠️  No hospital-specific information
 
-## 📚 More Information
-
-- **Detailed Testing:** See [TEST_GUIDE.md](./TEST_GUIDE.md)
-- **Deployment:** See [../DEPLOYMENT.md](../DEPLOYMENT.md)
-- **README:** See [README.md](./README.md)
+**Appointment Queries:**
+- ⚠️  Basic appointment functionality
+- ⚠️  Generic doctor information
+- ⚠️  Still works, but less accurate
 
 ---
 
-## 🎉 You're Ready!
+## 🎯 Key Features
 
-The backend is fully functional with:
-- ✅ Patient Management
-- ✅ Authentication (JWT)
-- ✅ Appointments
-- ✅ Medical Records
-- ✅ Support Tickets
-- ✅ Interactive API Docs
+### 1. Routing Agent Coordinates
+- Classifies user intent
+- Queries QnA Agent for information
+- Provides context to Appointment Agent
+- Central orchestrator
 
-Happy coding! 🚀
+### 2. QnA Agent with RAG
+- Retrieves information from knowledge base
+- Provides information to Routing Agent
+- Can also handle Q&A requests directly
 
+### 3. Appointment Agent
+- Receives context from Routing Agent
+- Uses RAG information (via Routing Agent)
+- Books appointments with accurate data
+- No direct dependencies
+
+---
+
+## 🚀 Ready to Use!
+
+1. ✅ Start server: `bash run_server.sh`
+2. ✅ Start client: `npm run dev`
+3. ✅ Open browser: `http://localhost:5173`
+4. ✅ Test appointments and Q&A
+
+**The system is ready!** The Routing Agent will coordinate all information flow, querying the QnA Agent (with RAG) and providing context to the Appointment Agent. 🎉

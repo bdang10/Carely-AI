@@ -40,16 +40,29 @@ When users want to schedule appointments:
 
 Remember: You are an assistant that provides information and guidance, but not medical diagnoses or treatment prescriptions."""
 
-# Initialize OpenAI client and Appointment Agent
+# Initialize OpenAI client and Agents
 openai_client = None
 appointment_agent = None
 routing_agent = None
 qna_agent = None
 if settings.OPENAI_API_KEY:
     openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    
+    # Initialize QnA agent first (with RAG if enabled)
+    print(f"🔧 Initializing agents...")
+    print(f"   RAG_ENABLED: {settings.RAG_ENABLED}")
+    print(f"   PINECONE_API_KEY present: {bool(settings.PINECONE_API_KEY)}")
+    
+    qna_agent = QnaAgent(openai_client, use_rag=settings.RAG_ENABLED)
+    print(f"✅ QnA Agent initialized (use_rag={settings.RAG_ENABLED})")
+    
+    # Initialize routing agent with QnA agent (routing agent coordinates information flow)
+    routing_agent = RoutingAgent(openai_client, qna_agent=qna_agent)
+    print(f"✅ Routing Agent initialized with QnA Agent")
+    
+    # Initialize appointment agent (receives context from routing agent)
     appointment_agent = AppointmentAgent(openai_client)
-    routing_agent = RoutingAgent(openai_client)
-    qna_agent = QnaAgent(openai_client)
+    print(f"✅ Appointment Agent initialized")
 
 
 @router.post("/", response_model=ChatMessageResponse, status_code=status.HTTP_200_OK)
@@ -129,13 +142,19 @@ async def chat(
         appointment_data = None
         
         if target_service == "appointment_service" and appointment_agent:
+            # Get context from routing agent (which queries QnA agent with RAG)
+            print("🔄 Getting appointment context from Routing Agent...")
+            context = routing_agent.get_appointment_context() if routing_agent else None
+            print(f"✅ Context received: {list(context.keys()) if context else 'None'}")
+            
             appointment_intent = appointment_agent.detect_appointment_intent(user_message)
             ai_response, appointment_data = await appointment_agent.process_appointment_request(
                 message=user_message,
                 conversation_history=conversation_history,
                 patient_id=patient_id,
                 db=db,
-                intent=appointment_intent
+                intent=appointment_intent,
+                context=context
             )
         elif target_service == "qna_service" and qna_agent:
             ai_response = qna_agent.generate_response(

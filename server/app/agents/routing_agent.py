@@ -123,18 +123,23 @@ class RoutingResult:
 
 
 class RoutingAgent:
-    """Hybrid keyword + LLM routing agent for scheduling vs Q&A intents."""
+    """
+    Hybrid keyword + LLM routing agent for scheduling vs Q&A intents.
+    Also coordinates information flow between agents.
+    """
 
     def __init__(
         self,
         openai_client: Optional[OpenAI],
         *,
+        qna_agent=None,
         intent_map: Optional[Dict[str, List[str]]] = None,
         system_prompt: str = ROUTER_SYSTEM_PROMPT,
         router_model: str = "gpt-4o-mini",
         min_confidence_for_rules: float = 0.6,
     ) -> None:
         self.client = openai_client
+        self.qna_agent = qna_agent
         self.intent_map = intent_map or DEFAULT_INTENT_KEYWORDS
         self.system_prompt = system_prompt
         self.router_model = router_model
@@ -296,5 +301,79 @@ class RoutingAgent:
             "payload": payload,
             "raw_result": result.to_dict(),
         }
+
+    def get_appointment_context(self) -> Dict[str, str]:
+        """
+        Get doctor and schedule information from QnA agent for appointment scheduling.
+        This method coordinates information retrieval for the appointment agent.
+        """
+        if not self.qna_agent:
+            print("⚠️  Routing Agent: No QnA Agent available")
+            return {
+                "doctor_info": "Doctor information available upon request.",
+                "schedule_info": "Schedule information available upon request."
+            }
+        
+        try:
+            # Query QnA agent for doctor information
+            # Use multiple targeted queries to get comprehensive coverage
+            print("🔄 Routing Agent: Requesting doctor information from QnA Agent...")
+            print(f"   QnA Agent has RAG: {hasattr(self.qna_agent, 'rag_instance') and self.qna_agent.rag_instance is not None}")
+            print(f"   QnA Agent use_rag: {getattr(self.qna_agent, 'use_rag', False)}")
+            
+            # Query for different specialties to get better RAG coverage
+            # Each query retrieves top_k=3 chunks, so multiple queries = more coverage
+            queries = [
+                "cardiology doctors cardiologists heart specialists available appointment",
+                "primary care family medicine internal medicine doctors available",
+                "surgery orthopedic pediatric specialists gynecology doctors",
+                "find provider doctor names specialties schedule appointment booking"
+            ]
+            
+            all_doctor_info = []
+            for query in queries:
+                print(f"   Querying: {query[:50]}...")
+                response = self.qna_agent.generate_response(query)
+                if response and len(response) > 100:  # Only include substantial responses
+                    all_doctor_info.append(response)
+            
+            # Combine all responses
+            doctor_info = "\n\n".join(all_doctor_info)
+            
+            print("✅ Routing Agent: Received doctor information from QnA Agent")
+            print(f"   Total info length: {len(doctor_info)} characters")
+            print(f"   Doctor info preview: {doctor_info[:300]}...")
+            
+            return {
+                "doctor_info": doctor_info,
+                "schedule_info": "Available through doctor information above"
+            }
+        except Exception as e:
+            print(f"⚠️  Routing Agent: Error getting context from QnA agent: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "doctor_info": "Doctor information temporarily unavailable.",
+                "schedule_info": "Schedule information temporarily unavailable."
+            }
+    
+    def get_doctor_schedule(self, doctor_name: str) -> str:
+        """
+        Get specific doctor's schedule from QnA agent.
+        This method coordinates schedule retrieval for the appointment agent.
+        """
+        if not self.qna_agent:
+            return "Schedule information available upon request."
+        
+        try:
+            print(f"🔄 Routing Agent: Requesting schedule for {doctor_name} from QnA Agent...")
+            schedule_info = self.qna_agent.generate_response(
+                f"What is {doctor_name}'s schedule and availability?"
+            )
+            print(f"✅ Routing Agent: Received schedule for {doctor_name}")
+            return schedule_info
+        except Exception as e:
+            print(f"⚠️  Routing Agent: Error getting schedule from QnA agent: {e}")
+            return f"Schedule for {doctor_name} temporarily unavailable."
 
 
