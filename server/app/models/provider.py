@@ -1,5 +1,5 @@
 """Provider database model"""
-from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
 from datetime import datetime
 from app.db.base import Base
 
@@ -14,7 +14,7 @@ class Provider(Base):
     phone_number = Column(String)
     specialty = Column(String)
     address = Column(Text)
-    is_active = Column(Integer, default=1)
+    is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -9,29 +9,20 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=sqlite:///./carely.db
+      # Override DEBUG for development
       - DEBUG=True
     volumes:
+      # Mount source code for hot-reload during development
       - ./app:/app/app
-      - ./carely.db:/app/carely.db
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+      - ./RAG:/app/RAG
     restart: unless-stopped
 
-  # PostgreSQL database (optional, uncomment if needed)
-  # db:
-  #   image: postgres:15
-  #   container_name: carely-db
-  #   environment:
-  #     POSTGRES_USER: carely
-  #     POSTGRES_PASSWORD: carely123
-  #     POSTGRES_DB: carely
-  #   ports:
-  #     - "5432:5432"
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   restart: unless-stopped
-
-# volumes:
-#   postgres_data:
+  # Note: Using Neon serverless Postgres (no local database needed)
+  # DATABASE_URL is loaded from .env file
+  # Make sure .env contains your Neon pooled connection string:
+  # DATABASE_URL=postgresql://username:password@ep-xxxxx-pooler.region.aws.neon.tech/carely?sslmode=require
 
 
 

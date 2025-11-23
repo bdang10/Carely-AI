@@ -9,8 +9,10 @@ from app.db.base import Base
 from app.db import base_all
 from app.db.session import engine
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+# NOTE: Database migrations are now managed by Alembic
+# To create tables, run: alembic upgrade head
+# For development, you can uncomment the line below to auto-create tables:
+# Base.metadata.create_all(bind=engine)
 
 # Initialize FastAPI application
 app = FastAPI(

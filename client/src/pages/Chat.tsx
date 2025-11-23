@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { ChatHeader } from "@/components/ChatHeader";
 import { ChatMessage } from "@/components/ChatMessage";
 import { ChatInput } from "@/components/ChatInput";
-import { chatApi } from "@/utils/api";
+import { chatApi, validateToken } from "@/utils/api";
 
 interface Message {
   id: string;
@@ -44,12 +44,15 @@ const Chat = () => {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Check authentication on mount
+  // Validate token on mount for protected route
   useEffect(() => {
-    const isLoggedIn = localStorage.getItem("isLoggedIn");
-    if (isLoggedIn !== "true") {
-      navigate("/");
-    }
+    const checkAuth = async () => {
+      const isValid = await validateToken();
+      if (!isValid) {
+        navigate("/");
+      }
+    };
+    checkAuth();
   }, [navigate]);
 
   const scrollToBottom = () => {
@@ -101,6 +104,12 @@ const Chat = () => {
         ];
       });
     } catch (error) {
+      // Handle unauthorized errors - token was invalid
+      if (error instanceof Error && error.message === 'UNAUTHORIZED') {
+        navigate("/");
+        return;
+      }
+      
       console.error("Error getting response:", error);
       setMessages((prev) => {
         const filtered = prev.filter((msg) => !msg.isLoading);

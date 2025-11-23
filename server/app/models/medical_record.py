@@ -1,5 +1,5 @@
 """Medical Record database model"""
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Float
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Float, Boolean
 from datetime import datetime
 from app.db.base import Base
 
@@ -25,7 +25,7 @@ class MedicalRecord(Base):
     heart_rate = Column(Integer)
     temperature = Column(Float)
     notes = Column(Text)
-    follow_up_required = Column(Integer, default=0)
+    follow_up_required = Column(Boolean, default=False)
     follow_up_date = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

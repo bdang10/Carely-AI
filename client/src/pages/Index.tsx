@@ -1,13 +1,15 @@
 import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router-dom";
 import { MessageSquare, Shield, Clock, Heart } from "lucide-react";
+import { getAccessToken } from "@/utils/api";
 
 const Landing = () => {
   const navigate = useNavigate();
 
   const handleGetStarted = () => {
-    const isLoggedIn = localStorage.getItem("isLoggedIn");
-    if (isLoggedIn === "true") {
+    // Fast check for UX - backend will validate on first API call anyway
+    const token = getAccessToken();
+    if (token) {
       navigate("/chat");
     } else {
       navigate("/auth");

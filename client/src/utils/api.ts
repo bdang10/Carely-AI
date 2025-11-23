@@ -94,6 +94,23 @@ export const removeAccessToken = (): void => {
   localStorage.removeItem('isLoggedIn');
 };
 
+// Validate token by checking with backend (for protected routes)
+export const validateToken = async (): Promise<boolean> => {
+  const token = getAccessToken();
+  if (!token) {
+    return false;
+  }
+
+  try {
+    await authApi.getCurrentUser();
+    return true;
+  } catch (error) {
+    // Token is invalid, clear it
+    removeAccessToken();
+    return false;
+  }
+};
+
 // Helper function for API requests
 async function apiRequest<T>(
   endpoint: string,
@@ -115,6 +132,13 @@ async function apiRequest<T>(
   });
 
   if (!response.ok) {
+    // Handle 401 Unauthorized - token is invalid or expired
+    if (response.status === 401) {
+      removeAccessToken();
+      // Throw a specific error that components can catch
+      throw new Error('UNAUTHORIZED');
+    }
+
     const error: ApiError = await response.json().catch(() => ({
       detail: 'An error occurred',
     }));

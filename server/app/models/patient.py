@@ -1,5 +1,5 @@
 """Patient database model"""
-from sqlalchemy import Column, Integer, String, DateTime, Date, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Date, Text, ForeignKey, Boolean
 from datetime import datetime
 from app.db.base import Base
 
@@ -26,7 +26,7 @@ class Patient(Base):
     insurance_provider = Column(String)
     insurance_policy_number = Column(String)
     preferred_language = Column(String, default="en")
-    is_active = Column(Integer, default=1)
+    is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -1,5 +1,5 @@
 """Appointment database model"""
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Boolean
 from datetime import datetime
 from app.db.base import Base
 
@@ -18,8 +18,8 @@ class Appointment(Base):
     reason = Column(Text)
     notes = Column(Text)
     location = Column(String)
-    is_virtual = Column(Integer, default=0)  # 0 for in-person, 1 for virtual
-    reminder_sent = Column(Integer, default=0)
+    is_virtual = Column(Boolean, default=False)
+    reminder_sent = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
