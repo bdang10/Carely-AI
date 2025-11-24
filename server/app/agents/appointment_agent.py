@@ -1,300 +1,359 @@
 """
 AI Agent for handling appointment scheduling through natural conversation.
-This agent extracts appointment details, suggests available slots, and completes bookings.
-Receives doctor and schedule information from the Routing Agent (which coordinates with QnA Agent).
+This agent queries the Provider database directly to find doctors and uses
+OpenAI function calling for all appointment operations.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from openai import OpenAI
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 import json
-import re
 
-from app.core.config import settings
 from app.models.appointment import Appointment
-from app.models.patient import Patient
+from app.models.provider import Provider
 
 
 class AppointmentAgent:
-    """AI Agent that handles appointment scheduling requests with context from Routing Agent"""
+    """AI Agent that handles appointment scheduling with direct database queries"""
     
     def __init__(self, openai_client: OpenAI):
         self.client = openai_client
         self.system_prompt = self._build_system_prompt()
     
-    def _build_system_prompt_with_context(self, doctor_info: str = None, schedule_info: str = None) -> str:
-        """Build system prompt with doctor and schedule context from Routing Agent"""
-        base_prompt = """You are an intelligent appointment management agent for Carely Healthcare.
-
-⚠️ IMPORTANT: Each appointment booking is INDEPENDENT. Do NOT assume the user wants the same doctor as previous appointments unless explicitly stated.
+    def _build_system_prompt(self) -> str:
+        """Build system prompt for the appointment agent"""
+        return f"""You are an intelligent appointment management agent for Carely Healthcare.
 
 Your responsibilities:
-1. **For NEW appointment requests**: ALWAYS ask which doctor they want, even if they've booked before
-2. **Show available doctors** from the knowledge base provided below
-3. **Confirm all details**: doctor name, date, time, reason
-4. **Use function calling** to book appointments (required!)
+1. **Intelligently match symptoms to specialties** - Analyze user symptoms and automatically recommend the appropriate doctor specialty
+2. **Search for doctors** - Use search_providers tool to find doctors by specialty or name
+3. **Book appointments** - Schedule new appointments with doctors from the database
+4. **List appointments** - Show user's upcoming and past appointments
+5. **Update appointments** - Reschedule or modify existing appointments
+6. **Cancel appointments** - Cancel appointments by ID
 
-CRITICAL RULES:
-- DO NOT default to previously mentioned doctors
-- ALWAYS let user choose their doctor for each new appointment
-- If user doesn't specify a doctor, list available options
-- Each appointment is a fresh request
+CRITICAL: INTELLIGENT SYMPTOM-TO-SPECIALTY MATCHING
+You MUST automatically analyze user symptoms and recommend the appropriate specialty WITHOUT asking the user which type of doctor they need.
 
-BOOKING WORKFLOW:
-1. User: "I need an appointment"
-2. You: "I can help! What type of doctor do you need? We have [list from knowledge base]"
-3. User: Specifies doctor/specialty
-4. You: "Great! When would you like to see [doctor]?"
-5. User: Provides date/time
-6. You: Call book_appointment function with details
+When a user describes symptoms or health concerns:
+1. IMMEDIATELY identify the appropriate specialty using the SYMPTOM-TO-SPECIALTY MAPPING below
+2. AUTOMATICALLY use search_providers with that specialty
+3. Present the matching doctors with an explanation (e.g., "For your headache, I'd recommend seeing a primary care doctor. Here are some options...")
+4. Do NOT ask "What type of doctor do you need?" - be proactive and intelligent
 
-EXAMPLE CONVERSATION:
-User: "I need another appointment"
-You: "Of course! What type of doctor do you need to see? We have cardiologists, primary care doctors, surgeons, and many other specialists available."
+SYMPTOM-TO-SPECIALTY MAPPING (Use this to automatically recommend the right doctor):
 
-User: "I need a cardiologist" 
-You: "We have these cardiologists available:
-- Dr. Benjamin Wu
-- Dr. Anthony Ea
-Which would you prefer?"
+**Primary Care / Family Medicine** (Start here for general symptoms):
+- Headache, head pain, head hurts → PRIMARY CARE
+- Fever, cold, flu, cough, sore throat, runny nose → PRIMARY CARE
+- General pain, aches, "I don't feel well", feeling sick → PRIMARY CARE
+- General check-ups, routine physicals, preventive care, annual exam → PRIMARY CARE
+- Stomach ache, stomach pain, nausea, vomiting, diarrhea (non-emergency) → PRIMARY CARE
+- Fatigue, tiredness, general weakness, feeling tired → PRIMARY CARE
+- Minor injuries, cuts, bruises, scrapes → PRIMARY CARE
+- Medication refills, prescription questions → PRIMARY CARE
+- General health concerns, wellness visits → PRIMARY CARE
+- "I need to see a doctor" (unspecified) → PRIMARY CARE
 
-**For showing available slots**:
-{{
-  "action": "show_slots",
-  "slot_request": {{
-    "start_date": "2024-11-10",
-    "days_ahead": 7,
-    "doctor_name": "Dr. Sarah Johnson"
-  }}
-}}
+**Cardiology** (Heart and cardiovascular issues):
+- Heart problems, heart pain, heart hurts, heart issue → CARDIOLOGY
+- Chest pain (especially if cardiac-related), chest discomfort → CARDIOLOGY
+- Heart palpitations, irregular heartbeat, arrhythmia → CARDIOLOGY
+- High blood pressure, hypertension, BP issues → CARDIOLOGY
+- Shortness of breath (if cardiac-related), difficulty breathing (cardiac) → CARDIOLOGY
+- Heart disease, heart attack history, cardiac history → CARDIOLOGY
+- "Heart problem", "heart condition", "cardiac issue" → CARDIOLOGY
 
-**For listing appointments**:
-{{
-  "action": "list_appointments",
-  "filters": {{}}
-}}
+**Orthopedics** (Bones, joints, muscles, musculoskeletal):
+- Back pain, back hurts, lower back pain, upper back pain → ORTHOPEDICS
+- Neck pain, neck hurts → ORTHOPEDICS
+- Joint pain, joint problems, arthritis → ORTHOPEDICS
+- Broken bones, fractures, sprains, strains → ORTHOPEDICS
+- Sports injuries, muscle strains, muscle pain → ORTHOPEDICS
+- Shoulder pain, knee pain, hip pain, ankle pain → ORTHOPEDICS
+- Bone-related issues, bone pain → ORTHOPEDICS
+- "My [body part] hurts" (musculoskeletal) → ORTHOPEDICS
 
-**For canceling appointments**:
-{{
-  "action": "cancel_appointment",
-  "appointment_id": 123
-}}
-"""
-        
-        # Add doctor information if provided by Routing Agent
-        if doctor_info:
-            base_prompt += f"\n\n**Doctor Information (from Knowledge Base):**\n{doctor_info}\n"
-        
-        # Add schedule information if provided by Routing Agent
-        if schedule_info and schedule_info != "Available through doctor information above":
-            base_prompt += f"\n\n**Schedule Information:**\n{schedule_info}\n"
-        
-        base_prompt += """
-Conversation style:
-- Be warm, empathetic, and professional
-- Use clear, simple language
-- Confirm understanding of user requests
-- Provide helpful suggestions
-- Maintain HIPAA-compliant privacy
+**Neurology** (Brain and nervous system):
+- Severe headaches, chronic headaches, migraines (if severe/chronic) → NEUROLOGY
+- Seizures, epilepsy, convulsions → NEUROLOGY
+- Dizziness, vertigo, balance problems → NEUROLOGY
+- Numbness, tingling, pins and needles → NEUROLOGY
+- Memory problems, cognitive issues, confusion → NEUROLOGY
+- Stroke symptoms, neurological disorders → NEUROLOGY
+- Tremors, movement disorders → NEUROLOGY
 
-Remember: 
-- Always include the JSON action when performing operations
-- For new bookings, you MUST include the JSON or the appointment will NOT be created
-- Confirm all details before booking
-"""
-        
-        return base_prompt
-    
-    def _build_system_prompt(self) -> str:
-        """Build a basic system prompt for the appointment agent"""
-        return """You are an intelligent appointment management agent for Carely Healthcare.
+**Dermatology** (Skin, hair, nails):
+- Skin rashes, rash, skin irritation → DERMATOLOGY
+- Acne, pimples, skin breakouts → DERMATOLOGY
+- Eczema, psoriasis, skin conditions → DERMATOLOGY
+- Skin infections, skin growths, moles → DERMATOLOGY
+- Hair loss, hair problems → DERMATOLOGY
+- Nail problems, nail issues → DERMATOLOGY
+- Allergic skin reactions, hives → DERMATOLOGY
+- "Skin problem", "skin issue" → DERMATOLOGY
 
-Your capabilities:
-1. **Book appointments** - Schedule new appointments with doctors
-2. **List appointments** - Show user's upcoming and past appointments  
-3. **Cancel appointments** - Cancel existing appointments by ID
-4. **Update/Reschedule appointments** - Modify appointment times and details
-5. **Show available slots** - Display available time slots
+**Psychiatry** (Mental health):
+- Depression, feeling depressed, sad, down → PSYCHIATRY
+- Anxiety, anxious, panic attacks, stress → PSYCHIATRY
+- Mental health concerns, mental health issues → PSYCHIATRY
+- Mood disorders, bipolar, emotional problems → PSYCHIATRY
+- "Mental health", "therapy", "counseling" → PSYCHIATRY
 
-Note: Doctor information and schedules will be provided dynamically from the knowledge base when needed.
-If you need more information about doctors or their schedules, you can query the knowledge base.
+**Gynecology** (Women's health):
+- Women's health issues, reproductive health → GYNECOLOGY
+- Menstrual problems, period issues, pelvic pain → GYNECOLOGY
+- Pregnancy-related concerns, prenatal care → GYNECOLOGY
+- "Gynecologist", "women's health", "OB/GYN" → GYNECOLOGY
 
-Guidelines:
-- Be conversational, friendly, and helpful
-- For booking: Ask clarifying questions if details are missing
-- For cancellations: Confirm before cancelling
-- For updates: Ask what they want to change
+**Pediatrics** (Children):
+- Any health concern for children/infants/babies → PEDIATRICS
+- "My child", "my baby", "pediatric" → PEDIATRICS
+
+**Emergency / Urgent Care**:
+- Severe chest pain, severe difficulty breathing → EMERGENCY
+- Severe injuries, trauma, major accidents → EMERGENCY
+- Suspected stroke, heart attack symptoms → EMERGENCY
+- Severe allergic reactions, anaphylaxis → EMERGENCY
+- "Emergency", "urgent", "immediate", "right now" → EMERGENCY
+
+SPECIALTY NAME MATCHING (When user specifies specialty directly):
+- "cardiologist" or "cardiology" → search for "Cardiology"
+- "primary care" or "family medicine" or "general practitioner" or "GP" → search for "Primary Care" or "Family Medicine"
+- "surgeon" or "surgery" → search for "Surgery"
+- "pediatrician" or "pediatrics" → search for "Pediatrics"
+- "orthopedic" or "orthopedist" → search for "Orthopedics"
+- "dermatologist" or "dermatology" → search for "Dermatology"
+- "neurologist" or "neurology" → search for "Neurology"
+- "psychiatrist" or "psychiatry" → search for "Psychiatry"
+- "gynecologist" or "gynecology" or "OB/GYN" → search for "Gynecology"
+
+WORKFLOW FOR BOOKING:
+1. **Analyze user message**:
+   - If symptoms described → AUTOMATICALLY identify specialty from SYMPTOM-TO-SPECIALTY MAPPING
+   - If specialty specified → Use that specialty
+   - If doctor name specified → Search by name
+2. **IMMEDIATELY use search_providers** with the identified specialty (don't ask the user)
+3. **Present doctors** with explanation: "For your [symptom], I'd recommend seeing a [specialty] doctor. Here are some options..."
+4. Once user confirms doctor, date/time, and reason → use book_appointment tool
+
+EXAMPLES OF INTELLIGENT MATCHING:
+- User: "I have a headache" → AUTOMATICALLY search for "Primary Care" (don't ask what type of doctor)
+- User: "I have heart problems" or "my heart hurts" → AUTOMATICALLY search for "Cardiology"
+- User: "My back hurts" → AUTOMATICALLY search for "Orthopedics"
+- User: "I need a check-up" → AUTOMATICALLY search for "Primary Care"
+- User: "I have a skin rash" → AUTOMATICALLY search for "Dermatology"
+- User: "I'm feeling anxious" → AUTOMATICALLY search for "Psychiatry"
+- User: "I have chest pain" → AUTOMATICALLY search for "Cardiology" (unless clearly non-cardiac)
+- User: "I have a fever and cough" → AUTOMATICALLY search for "Primary Care"
+
+GUIDELINES:
+- Always search for providers before booking - never assume a doctor exists
+- If multiple doctors match, present all options to the user
+- For booking: Ask for date/time, reason, and appointment type if not provided
 - Handle date/time parsing intelligently (e.g., "tomorrow at 2pm", "next Monday morning")
 - Default to 30-minute appointments unless specified
-- Remind users they can choose in-person or virtual appointments
+- Offer both in-person and virtual options
+- For cancellations: Confirm before cancelling
+- For updates: Ask what they want to change
 - Users can reference appointments by their ID number (e.g., "appointment #5")
 
-**CRITICAL: For booking new appointments**, when you have ALL required information (doctor, date/time, reason), 
-you MUST include the JSON object in your response. The appointment will ONLY be created if you include this JSON.
-Do NOT say the appointment is booked unless you include the JSON below:
-
-{{
-  "action": "book_appointment",
-  "appointment_details": {{
-    "appointment_type": "consultation",
-    "doctor_name": "Dr. James Williams",
-    "scheduled_time": "2024-11-22T10:00:00",
-    "reason": "Shoulder issue",
-    "is_virtual": false,
-    "duration_minutes": 30
-  }}
-}}
-
-Example good response when booking:
-"I'll book that appointment for you now.
-
-{{"action": "book_appointment", "appointment_details": {{"appointment_type": "consultation", "doctor_name": "Dr. James Williams", "scheduled_time": "2024-11-22T10:00:00", "reason": "Shoulder issue", "is_virtual": false, "duration_minutes": 30}}}}
-
-Your appointment is being scheduled!"
-
-**OLD FORMAT (DO NOT USE):**
-
-**For showing available slots**:
-{{
-  "action": "show_slots",
-  "date_range": "2024-11-10 to 2024-11-15"
-}}
-
-**For rescheduling**, when user provides new time and appointment ID:
-{{
-  "action": "update_appointment",
-  "appointment_id": 5,
-  "updates": {{
-    "scheduled_time": "2024-11-12T15:00:00"
-  }}
-}}
-
-Note: List and cancel operations are handled directly without AI processing.
+IMPORTANT:
+- You MUST use the search_providers tool to find doctors before booking
+- You MUST use the appropriate tool (book_appointment, update_appointment, cancel_appointment, list_appointments) for each operation
+- Never create appointments without using the book_appointment tool
+- Always verify provider exists in database before booking
 
 Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
     
-    def detect_appointment_intent(self, message: str) -> str:
-        """
-        Detect if the message is related to appointments and what type of operation.
-        Returns: 'create', 'list', 'view', 'update', 'cancel', or None
-        """
-        message_lower = message.lower()
-        
-        # Cancel/Delete keywords
-        cancel_keywords = ['cancel', 'delete', 'remove appointment', 'cancel appointment']
-        if any(keyword in message_lower for keyword in cancel_keywords):
-            return 'cancel'
-        
-        # Update/Reschedule keywords
-        update_keywords = ['reschedule', 'change', 'move', 'update', 'modify appointment']
-        if any(keyword in message_lower for keyword in update_keywords):
-            return 'update'
-        
-        # List/View all appointments
-        list_keywords = ['my appointments', 'my appointment', 'list appointments', 'list appointment',
-                        'show appointments', 'show appointment', 'show my', 'list my',
-                        'view appointments', 'view appointment', 'view my',
-                        'upcoming appointments', 'appointment history', 'see my appointments',
-                        'all appointments', 'next appointment', 'check my appointments',
-                        'display appointments', 'get my appointments', 'what appointments']
-        if any(keyword in message_lower for keyword in list_keywords):
-            return 'list'
-        
-        # Create/Book keywords
-        create_keywords = ['book', 'schedule', 'make appointment', 'need appointment',
-                          'want appointment', 'see a doctor', 'consultation', 'check-up',
-                          'available', 'time slot']
-        if any(keyword in message_lower for keyword in create_keywords):
-            return 'create'
-        
-        # Check for general appointment mention
-        if 'appointment' in message_lower:
-            return 'general'
-        
-        return None
+    def _get_providers_by_specialty(self, specialty: str, db: Session) -> List[Provider]:
+        """Query providers by specialty"""
+        return db.query(Provider).filter(
+            Provider.specialty.ilike(f"%{specialty}%"),
+            Provider.is_active == True
+        ).all()
     
+    def _search_providers(self, query: str, db: Session) -> List[Provider]:
+        """Search providers by name or specialty (fuzzy matching)"""
+        return db.query(Provider).filter(
+            or_(
+                Provider.name.ilike(f"%{query}%"),
+                Provider.specialty.ilike(f"%{query}%")
+            ),
+            Provider.is_active == True
+        ).all()
     
-    def generate_available_slots(
-        self, 
-        start_date: Optional[datetime] = None,
-        days_ahead: int = 7,
-        doctor_name: str = None
-    ) -> List[Dict]:
-        """
-        Generate available appointment slots.
-        First tries to get schedule from RAG, falls back to default schedule.
-        """
-        if start_date is None:
-            start_date = datetime.now()
-        
-        # Remove time component
-        start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # Note: Schedule information is provided via context from Routing Agent
-        # In a production system, parse the context to generate slots based on actual availability
-        print(f"📅 Generating generic slots for {doctor_name or 'all doctors'}")
-        
-        slots = []
-        
-        # Generate slots for next N days (weekdays only, 9 AM - 5 PM)
-        # In a production system, this would be based on actual doctor schedules from RAG
-        for day_offset in range(days_ahead):
-            current_date = start_date + timedelta(days=day_offset)
-            
-            # Skip weekends
-            if current_date.weekday() >= 5:
-                continue
-            
-            # Generate slots for business hours (9 AM - 5 PM, every 30 mins)
-            for hour in range(9, 17):
-                for minute in [0, 30]:
-                    slot_time = current_date.replace(hour=hour, minute=minute)
-                    
-                    # Skip past times
-                    if slot_time < datetime.now():
-                        continue
-                    
-                    slots.append({
-                        "datetime": slot_time.isoformat(),
-                        "formatted": slot_time.strftime("%A, %B %d at %I:%M %p"),
-                        "available": True,
-                        "doctor": doctor_name if doctor_name else "Any available doctor"
-                    })
-        
-        return slots[:20]  # Return first 20 available slots
-    
-    def extract_appointment_details(self, ai_response: str) -> Optional[Dict]:
-        """
-        Extract appointment details from AI response if present.
-        Looks for JSON data in the response.
-        """
+    def _search_providers_tool(self, query: str, db: Session) -> Tuple[str, Dict]:
+        """Tool handler for searching providers"""
         try:
-            # Try to find JSON in the response
-            json_match = re.search(r'\{[\s\S]*\}', ai_response)
-            if json_match:
-                json_str = json_match.group(0)
-                data = json.loads(json_str)
+            providers = self._search_providers(query, db)
+            
+            if not providers:
+                return f"I couldn't find any doctors matching '{query}'. Please try a different search term or specialty.", {
+                    "action": "search_providers",
+                    "query": query,
+                    "providers": [],
+                    "count": 0
+                }
+            
+            provider_list = []
+            response = f"🔍 **Found {len(providers)} doctor(s) matching '{query}':**\n\n"
+            
+            for provider in providers:
+                response += f"**{provider.name}**\n"
+                if provider.specialty:
+                    response += f"   • Specialty: {provider.specialty}\n"
+                if provider.email:
+                    response += f"   • Email: {provider.email}\n"
+                if provider.phone_number:
+                    response += f"   • Phone: {provider.phone_number}\n"
+                response += f"   • ID: {provider.id}\n\n"
                 
-                if data.get('action') in ['book_appointment', 'show_slots', 'list_appointments', 
-                                          'cancel_appointment', 'update_appointment']:
-                    return data
-        except (json.JSONDecodeError, AttributeError):
-            pass
-        
-        return None
+                provider_list.append({
+                    "id": provider.id,
+                    "name": provider.name,
+                    "specialty": provider.specialty,
+                    "email": provider.email,
+                    "phone_number": provider.phone_number
+                })
+            
+            response += "\n💡 To book an appointment, tell me which doctor you'd like to see and when."
+            
+            return response, {
+                "action": "search_providers",
+                "query": query,
+                "providers": provider_list,
+                "count": len(providers)
+            }
+        except Exception as e:
+            return f"I encountered an error searching for doctors: {str(e)}", {
+                "action": "search_providers",
+                "error": str(e),
+                "success": False
+            }
     
-    def list_appointments(self, patient_id: int, db: Session, limit: int = 10) -> Tuple[str, Dict]:
-        """
-        List appointments for a patient.
-        Returns formatted message and appointment data.
-        """
+    def _book_appointment_tool(
+        self,
+        patient_id: int,
+        provider_id: int,
+        scheduled_time: str,
+        reason: str,
+        appointment_type: str = "consultation",
+        is_virtual: bool = False,
+        duration_minutes: int = 30,
+        db: Session = None
+    ) -> Tuple[str, Dict]:
+        """Tool handler for booking appointments"""
         try:
-            # Query appointments (exclude cancelled ones)
-            appointments = db.query(Appointment).filter(
-                Appointment.patient_id == patient_id,
-                Appointment.status != 'cancelled'
-            ).order_by(Appointment.scheduled_time.desc()).limit(limit).all()
+            # Verify provider exists
+            provider = db.query(Provider).filter(
+                Provider.id == provider_id,
+                Provider.is_active == True
+            ).first()
+            
+            if not provider:
+                return f"Provider with ID {provider_id} not found or is inactive. Please search for providers first.", {
+                    "action": "book_appointment",
+                    "success": False,
+                    "error": "Provider not found"
+                }
+            
+            # Parse scheduled time
+            try:
+                scheduled_datetime = datetime.fromisoformat(scheduled_time.replace('Z', '+00:00'))
+                # Remove timezone info for database storage
+                if scheduled_datetime.tzinfo:
+                    scheduled_datetime = scheduled_datetime.replace(tzinfo=None)
+            except ValueError:
+                return f"Invalid date/time format: {scheduled_time}. Please use ISO format (e.g., '2024-11-22T10:00:00').", {
+                    "action": "book_appointment",
+                    "success": False,
+                    "error": "Invalid date/time format"
+                }
+            
+            # Check if time is in the past
+            if scheduled_datetime < datetime.now():
+                return "Cannot book appointments in the past. Please choose a future date and time.", {
+                    "action": "book_appointment",
+                    "success": False,
+                    "error": "Past date/time"
+                }
+            
+            # Create appointment
+            appointment = Appointment(
+                patient_id=patient_id,
+                doctor_name=provider.name,
+                appointment_type=appointment_type,
+                scheduled_time=scheduled_datetime,
+                duration_minutes=duration_minutes,
+                reason=reason,
+                is_virtual=is_virtual,
+                status='scheduled',
+                location='Virtual' if is_virtual else 'Main Clinic'
+            )
+            
+            db.add(appointment)
+            db.commit()
+            db.refresh(appointment)
+            
+            response = f"""✅ **Appointment Booked Successfully!**
+
+📅 **Appointment Details:**
+- **ID:** #{appointment.id}
+- **Doctor:** {appointment.doctor_name}
+- **Type:** {appointment.appointment_type.title()}
+- **Date & Time:** {appointment.scheduled_time.strftime('%A, %B %d, %Y at %I:%M %p')}
+- **Duration:** {appointment.duration_minutes} minutes
+- **Location:** {'Virtual Meeting' if appointment.is_virtual else 'Main Clinic'}
+- **Reason:** {appointment.reason}
+
+You'll receive a reminder 24 hours before your appointment. If you need to reschedule or cancel, just let me know!"""
+            
+            return response, {
+                "action": "book_appointment",
+                "success": True,
+                "appointment_id": appointment.id,
+                "appointment": {
+                    "id": appointment.id,
+                    "doctor_name": appointment.doctor_name,
+                    "appointment_type": appointment.appointment_type,
+                    "scheduled_time": appointment.scheduled_time.isoformat(),
+                    "duration_minutes": appointment.duration_minutes,
+                    "is_virtual": bool(appointment.is_virtual),
+                    "status": appointment.status,
+                    "reason": appointment.reason
+                }
+            }
+        except Exception as e:
+            db.rollback()
+            return f"I encountered an error booking the appointment: {str(e)}", {
+                "action": "book_appointment",
+                "success": False,
+                "error": str(e)
+            }
+    
+    def _list_appointments_tool(
+        self,
+        patient_id: int,
+        db: Session,
+        limit: int = 10,
+        status_filter: Optional[str] = None
+    ) -> Tuple[str, Dict]:
+        """Tool handler for listing appointments"""
+        try:
+            query = db.query(Appointment).filter(
+                Appointment.patient_id == patient_id
+            )
+            
+            if status_filter:
+                query = query.filter(Appointment.status == status_filter)
+            else:
+                # Exclude cancelled by default unless specifically requested
+                query = query.filter(Appointment.status != 'cancelled')
+            
+            appointments = query.order_by(Appointment.scheduled_time.desc()).limit(limit).all()
             
             if not appointments:
                 return "You don't have any appointments scheduled yet. Would you like to book one?", {
@@ -303,7 +362,6 @@ Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     "count": 0
                 }
             
-            # Format appointments
             response = f"📅 **Your Appointments** ({len(appointments)} total):\n\n"
             
             appointment_list = []
@@ -343,21 +401,21 @@ Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 "appointments": appointment_list,
                 "count": len(appointments)
             }
-            
         except Exception as e:
-            return f"I'm sorry, I encountered an error retrieving your appointments: {str(e)}", {
+            return f"I encountered an error retrieving your appointments: {str(e)}", {
                 "action": "list_appointments",
                 "error": str(e),
                 "success": False
             }
     
-    def cancel_appointment(self, patient_id: int, appointment_id: int, db: Session) -> Tuple[str, Dict]:
-        """
-        Cancel an appointment.
-        Returns confirmation message and status.
-        """
+    def _cancel_appointment_tool(
+        self,
+        patient_id: int,
+        appointment_id: int,
+        db: Session
+    ) -> Tuple[str, Dict]:
+        """Tool handler for canceling appointments"""
         try:
-            # Find appointment
             appointment = db.query(Appointment).filter(
                 Appointment.id == appointment_id,
                 Appointment.patient_id == patient_id
@@ -377,7 +435,6 @@ Current date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     "error": "Already cancelled"
                 }
             
-            # Cancel the appointment
             old_status = appointment.status
             appointment.status = 'cancelled'
             appointment.updated_at = datetime.utcnow()
@@ -406,28 +463,23 @@ If you'd like to book a new appointment, just let me know!"""
                     "status": appointment.status
                 }
             }
-            
         except Exception as e:
             db.rollback()
-            return f"I'm sorry, I encountered an error cancelling the appointment: {str(e)}", {
+            return f"I encountered an error cancelling the appointment: {str(e)}", {
                 "action": "cancel_appointment",
                 "success": False,
                 "error": str(e)
             }
     
-    def update_appointment(
-        self, 
-        patient_id: int, 
+    def _update_appointment_tool(
+        self,
+        patient_id: int,
         appointment_id: int,
         updates: Dict,
         db: Session
     ) -> Tuple[str, Dict]:
-        """
-        Update an appointment.
-        Returns confirmation message and updated data.
-        """
+        """Tool handler for updating appointments"""
         try:
-            # Find appointment
             appointment = db.query(Appointment).filter(
                 Appointment.id == appointment_id,
                 Appointment.patient_id == patient_id
@@ -447,19 +499,36 @@ If you'd like to book a new appointment, just let me know!"""
                     "error": "Appointment is cancelled"
                 }
             
-            # Store old values for confirmation
             old_time = appointment.scheduled_time
-            old_notes = appointment.notes
             
             # Update fields
             if 'scheduled_time' in updates:
-                appointment.scheduled_time = updates['scheduled_time']
+                try:
+                    new_time = datetime.fromisoformat(str(updates['scheduled_time']).replace('Z', '+00:00'))
+                    if new_time.tzinfo:
+                        new_time = new_time.replace(tzinfo=None)
+                    if new_time < datetime.now():
+                        return "Cannot reschedule to a past date/time. Please choose a future date and time.", {
+                            "action": "update_appointment",
+                            "success": False,
+                            "error": "Past date/time"
+                        }
+                    appointment.scheduled_time = new_time
+                except (ValueError, TypeError) as e:
+                    return f"Invalid date/time format: {updates.get('scheduled_time')}. Please use ISO format.", {
+                        "action": "update_appointment",
+                        "success": False,
+                        "error": "Invalid date/time format"
+                    }
+            
+            if 'reason' in updates:
+                appointment.reason = str(updates['reason'])
             if 'notes' in updates:
-                appointment.notes = updates['notes']
+                appointment.notes = str(updates['notes'])
             if 'duration_minutes' in updates:
-                appointment.duration_minutes = updates['duration_minutes']
+                appointment.duration_minutes = int(updates['duration_minutes'])
             if 'is_virtual' in updates:
-                appointment.is_virtual = int(updates['is_virtual'])
+                appointment.is_virtual = bool(updates['is_virtual'])
                 appointment.location = 'Virtual' if updates['is_virtual'] else 'Main Clinic'
             
             appointment.updated_at = datetime.utcnow()
@@ -497,14 +566,149 @@ Appointment #{appointment.id} has been successfully updated.
                     "status": appointment.status
                 }
             }
-            
         except Exception as e:
             db.rollback()
-            return f"I'm sorry, I encountered an error updating the appointment: {str(e)}", {
+            return f"I encountered an error updating the appointment: {str(e)}", {
                 "action": "update_appointment",
                 "success": False,
                 "error": str(e)
             }
+    
+    def _get_tools(self) -> List[Dict]:
+        """Define all function tools for OpenAI"""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_providers",
+                    "description": "Search for doctors/providers by specialty or name. Use this BEFORE booking to find available doctors.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search term - can be a specialty (e.g., 'cardiology', 'primary care') or doctor name (e.g., 'Dr. Smith')"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "book_appointment",
+                    "description": "Book a new medical appointment. Requires provider_id from search_providers, scheduled_time, and reason.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "provider_id": {
+                                "type": "integer",
+                                "description": "ID of the provider/doctor from search_providers results"
+                            },
+                            "scheduled_time": {
+                                "type": "string",
+                                "description": "Appointment date and time in ISO format (e.g., '2024-11-22T10:00:00')"
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Reason for the appointment"
+                            },
+                            "appointment_type": {
+                                "type": "string",
+                                "enum": ["consultation", "follow-up", "emergency", "check-up"],
+                                "description": "Type of appointment (default: consultation)"
+                            },
+                            "is_virtual": {
+                                "type": "boolean",
+                                "description": "Whether this is a virtual appointment (default: false)"
+                            },
+                            "duration_minutes": {
+                                "type": "integer",
+                                "description": "Duration in minutes (default: 30)"
+                            }
+                        },
+                        "required": ["provider_id", "scheduled_time", "reason"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_appointments",
+                    "description": "List user's appointments. Can filter by status if needed.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "status_filter": {
+                                "type": "string",
+                                "enum": ["scheduled", "confirmed", "completed", "cancelled"],
+                                "description": "Optional: Filter by status. If not provided, shows all non-cancelled appointments."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of appointments to return (default: 10)"
+                            }
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_appointment",
+                    "description": "Update/reschedule an existing appointment. Can change date/time, reason, notes, duration, or virtual status.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "appointment_id": {
+                                "type": "integer",
+                                "description": "ID of the appointment to update"
+                            },
+                            "scheduled_time": {
+                                "type": "string",
+                                "description": "New date and time in ISO format (e.g., '2024-11-22T15:00:00')"
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Updated reason for the appointment"
+                            },
+                            "notes": {
+                                "type": "string",
+                                "description": "Additional notes"
+                            },
+                            "duration_minutes": {
+                                "type": "integer",
+                                "description": "Updated duration in minutes"
+                            },
+                            "is_virtual": {
+                                "type": "boolean",
+                                "description": "Whether this is a virtual appointment"
+                            }
+                        },
+                        "required": ["appointment_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "cancel_appointment",
+                    "description": "Cancel an existing appointment by ID.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "appointment_id": {
+                                "type": "integer",
+                                "description": "ID of the appointment to cancel"
+                            }
+                        },
+                        "required": ["appointment_id"]
+                    }
+                }
+            }
+        ]
     
     async def process_appointment_request(
         self,
@@ -512,245 +716,156 @@ Appointment #{appointment.id} has been successfully updated.
         conversation_history: List[Dict],
         patient_id: int,
         db: Session,
-        intent: str = None,
-        context: Optional[Dict[str, str]] = None
+        intent: str = None
     ) -> Tuple[str, Optional[Dict]]:
         """
-        Process an appointment-related message.
-        Receives context (doctor info, schedules) from Routing Agent.
+        Process an appointment-related message using tool calling.
         Returns (AI response, appointment_data)
         """
-        # Handle direct operations (list, cancel specific appointment)
-        if intent == 'list':
-            return self.list_appointments(patient_id, db)
-        
-        # Check for appointment ID in message for cancel/update operations
-        appointment_id_match = re.search(r'#?(\d+)', message)
-        
-        if intent == 'cancel' and appointment_id_match:
-            appointment_id = int(appointment_id_match.group(1))
-            return self.cancel_appointment(patient_id, appointment_id, db)
-        
-        # Build system prompt with context from Routing Agent
-        doctor_info = context.get("doctor_info") if context else None
-        schedule_info = context.get("schedule_info") if context else None
-        
-        print(f"📋 Appointment Agent: Received context: {context is not None}")
-        if context:
-            print(f"   Context keys: {list(context.keys())}")
-            if doctor_info:
-                print(f"   Doctor info length: {len(doctor_info)} characters")
-                print(f"   Doctor info preview: {doctor_info[:200]}...")
-        
-        system_prompt_with_context = self._build_system_prompt_with_context(doctor_info, schedule_info)
-        
-        print(f"📝 System prompt length: {len(system_prompt_with_context)} characters")
-        print(f"   Contains doctor info: {'Doctor Information' in system_prompt_with_context}")
-        
         # Build messages for OpenAI
         messages = [
-            {"role": "system", "content": system_prompt_with_context}
+            {"role": "system", "content": self.system_prompt}
         ]
         
-        # Filter conversation history to prevent defaulting to previous doctors
-        # Detect if this is a new appointment request (not continuing previous conversation)
-        new_appointment_keywords = ['another appointment', 'new appointment', 'different doctor', 
-                                     'see a different', 'book another', 'schedule another',
-                                     'need to see', 'want to see', 'appointment for']
-        
-        is_new_request = any(keyword in message.lower() for keyword in new_appointment_keywords)
-        
-        if is_new_request:
-            # Limit history to avoid bias toward previous doctor
-            # Only include last 2 exchanges (4 messages) to maintain context
-            limited_history = conversation_history[-4:] if len(conversation_history) > 4 else conversation_history
-            print(f"   📌 New appointment detected - limiting history to last {len(limited_history)} messages")
-            messages.extend(limited_history)
-        else:
-            # Normal flow - include all history
-            messages.extend(conversation_history)
+        # Add conversation history
+        messages.extend(conversation_history)
         
         # Add current message
         messages.append({"role": "user", "content": message})
         
         try:
-            # Define function for booking appointments
-            tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "book_appointment",
-                        "description": "Book a NEW medical appointment. User must specify which doctor they want for THIS appointment - do not assume they want the same doctor as previous bookings.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "doctor_name": {
-                                    "type": "string",
-                                    "description": "Full name of the doctor (e.g. 'Dr. Michael Chen')"
-                                },
-                                "scheduled_time": {
-                                    "type": "string",
-                                    "description": "Appointment date and time in ISO format (e.g. '2024-11-22T10:00:00')"
-                                },
-                                "reason": {
-                                    "type": "string",
-                                    "description": "Reason for the appointment"
-                                },
-                                "appointment_type": {
-                                    "type": "string",
-                                    "enum": ["consultation", "follow-up", "emergency", "check-up"],
-                                    "description": "Type of appointment"
-                                },
-                                "is_virtual": {
-                                    "type": "boolean",
-                                    "description": "Whether this is a virtual appointment"
-                                },
-                                "duration_minutes": {
-                                    "type": "integer",
-                                    "description": "Duration in minutes (default 30)"
-                                }
-                            },
-                            "required": ["doctor_name", "scheduled_time", "reason"]
-                        }
-                    }
-                }
-            ]
+            # Get tools
+            tools = self._get_tools()
             
             # Call OpenAI API with function calling
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
                 tools=tools,
-                tool_choice="auto",  # Let the model decide when to call the function
+                tool_choice="auto",
                 temperature=0.3,
                 max_tokens=1000
             )
             
-            message = response.choices[0].message
-            ai_response = message.content.strip() if message.content else ""
+            message_obj = response.choices[0].message
+            ai_response = message_obj.content.strip() if message_obj.content else ""
             appointment_data = None
             
-            print(f"\n📝 AI Response:")
-            print(f"   Has content: {bool(ai_response)}")
-            print(f"   Has tool_calls: {bool(message.tool_calls)}")
-            
-            # Check if AI used function calling (preferred method)
-            if message.tool_calls:
-                tool_call = message.tool_calls[0]
-                if tool_call.function.name == "book_appointment":
-                    print(f"✅ AI used function calling to book appointment!")
-                    
-                    # Parse function arguments
-                    function_args = json.loads(tool_call.function.arguments)
-                    print(f"   Function args: {function_args}")
-                    
-                    # Convert to our appointment_data format
-                    appointment_data = {
-                        "action": "book_appointment",
-                        "appointment_details": {
-                            "doctor_name": function_args.get("doctor_name"),
-                            "scheduled_time": function_args.get("scheduled_time"),
-                            "reason": function_args.get("reason"),
-                            "appointment_type": function_args.get("appointment_type", "consultation"),
-                            "is_virtual": function_args.get("is_virtual", False),
-                            "duration_minutes": function_args.get("duration_minutes", 30)
+            # Process tool calls
+            if message_obj.tool_calls:
+                # Add assistant message with tool calls to conversation
+                messages.append({
+                    "role": "assistant",
+                    "content": message_obj.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
                         }
-                    }
+                        for tc in message_obj.tool_calls
+                    ]
+                })
+                
+                # Handle multiple tool calls (though typically one at a time)
+                first_tool_response = None
+                for tool_call in message_obj.tool_calls:
+                    function_name = tool_call.function.name
+                    function_args = json.loads(tool_call.function.arguments)
                     
-                    # Generate friendly response if AI didn't provide one
-                    if not ai_response:
-                        ai_response = f"Perfect! Booking your appointment with {function_args.get('doctor_name')}..."
-            
-            # Fallback: Try to extract JSON from text response
-            if not appointment_data and ai_response:
-                print(f"   Trying to extract JSON from text...")
-                print(f"   Length: {len(ai_response)} characters")
-                print(f"   Preview: {ai_response[:500]}...")
-                print(f"   Contains JSON: {'{' in ai_response and '}' in ai_response}")
-                
-                appointment_data = self.extract_appointment_details(ai_response)
-                print(f"   Extracted data from text: {appointment_data is not None}")
-                if appointment_data:
-                    print(f"   Action: {appointment_data.get('action')}")
-                else:
-                    # Check if AI is claiming to book without providing data
-                    booking_keywords = ['booked', 'scheduled', 'appointment has been', 'confirmed your appointment']
-                    if any(keyword in ai_response.lower() for keyword in booking_keywords):
-                        print(f"⚠️  WARNING: AI claims booking but no data found!")
-                        print(f"   This appointment will NOT be created in the database")
-                        ai_response += "\n\n⚠️ Note: To complete the booking, please confirm all details."
-            
-            # If booking appointment, create it in the database
-            if appointment_data and appointment_data.get('action') == 'book_appointment':
-                details = appointment_data.get('appointment_details', {})
-                
-                # Parse the scheduled time
-                scheduled_time_str = details.get('scheduled_time')
-                if scheduled_time_str:
-                    try:
-                        scheduled_time = datetime.fromisoformat(scheduled_time_str.replace('Z', '+00:00'))
-                        
-                        # Create appointment in database
-                        appointment = Appointment(
-                            patient_id=patient_id,
-                            doctor_name=details.get('doctor_name', 'Dr. Sarah Johnson'),
-                            appointment_type=details.get('appointment_type', 'consultation'),
-                            scheduled_time=scheduled_time,
-                            duration_minutes=details.get('duration_minutes', 30),
-                            reason=details.get('reason', ''),
-                            is_virtual=int(details.get('is_virtual', False)),
-                            status='scheduled',
-                            location='Main Clinic' if not details.get('is_virtual') else 'Virtual'
+                    print(f"🔧 Tool called: {function_name}")
+                    print(f"   Args: {function_args}")
+                    
+                    # Execute the appropriate tool
+                    if function_name == "search_providers":
+                        tool_response, tool_data = self._search_providers_tool(
+                            query=function_args.get("query", ""),
+                            db=db
                         )
-                        
-                        db.add(appointment)
-                        db.commit()
-                        db.refresh(appointment)
-                        
-                        # Add appointment ID to response data
-                        appointment_data['appointment_id'] = appointment.id
-                        appointment_data['success'] = True
-                        
-                        # Clean up the AI response to remove JSON
-                        ai_response = re.sub(r'\{[\s\S]*\}', '', ai_response).strip()
-                        
-                        # Add confirmation message if not present
-                        if not ai_response:
-                            ai_response = f"""✅ Appointment booked successfully!
-
-📅 **Appointment Details:**
-- **Doctor:** {appointment.doctor_name}
-- **Type:** {appointment.appointment_type.title()}
-- **Date & Time:** {appointment.scheduled_time.strftime('%A, %B %d, %Y at %I:%M %p')}
-- **Duration:** {appointment.duration_minutes} minutes
-- **Location:** {'Virtual Meeting' if appointment.is_virtual else 'Main Clinic'}
-- **Reason:** {appointment.reason}
-
-You'll receive a reminder 24 hours before your appointment. If you need to reschedule or cancel, just let me know!"""
-                        
-                    except (ValueError, KeyError) as e:
-                        appointment_data['success'] = False
-                        appointment_data['error'] = str(e)
+                        appointment_data = tool_data
+                    
+                    elif function_name == "book_appointment":
+                        tool_response, tool_data = self._book_appointment_tool(
+                            patient_id=patient_id,
+                            provider_id=function_args.get("provider_id"),
+                            scheduled_time=function_args.get("scheduled_time"),
+                            reason=function_args.get("reason"),
+                            appointment_type=function_args.get("appointment_type", "consultation"),
+                            is_virtual=function_args.get("is_virtual", False),
+                            duration_minutes=function_args.get("duration_minutes", 30),
+                            db=db
+                        )
+                        appointment_data = tool_data
+                    
+                    elif function_name == "list_appointments":
+                        tool_response, tool_data = self._list_appointments_tool(
+                            patient_id=patient_id,
+                            db=db,
+                            limit=function_args.get("limit", 10),
+                            status_filter=function_args.get("status_filter")
+                        )
+                        appointment_data = tool_data
+                    
+                    elif function_name == "update_appointment":
+                        updates = {k: v for k, v in function_args.items() if k != "appointment_id"}
+                        tool_response, tool_data = self._update_appointment_tool(
+                            patient_id=patient_id,
+                            appointment_id=function_args.get("appointment_id"),
+                            updates=updates,
+                            db=db
+                        )
+                        appointment_data = tool_data
+                    
+                    elif function_name == "cancel_appointment":
+                        tool_response, tool_data = self._cancel_appointment_tool(
+                            patient_id=patient_id,
+                            appointment_id=function_args.get("appointment_id"),
+                            db=db
+                        )
+                        appointment_data = tool_data
+                    
+                    # Store first tool response for fallback
+                    if first_tool_response is None:
+                        first_tool_response = tool_response
+                    
+                    # Add tool response to messages for follow-up
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_response
+                    })
+                
+                # Make a follow-up call to get final natural language response
+                follow_up_response = self.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=0.3,
+                    max_tokens=500
+                )
+                follow_up_message = follow_up_response.choices[0].message
+                
+                # Use LLM response if available, otherwise use tool response
+                if follow_up_message.content:
+                    ai_response = follow_up_message.content.strip()
+                elif first_tool_response:
+                    # Fallback to first tool response if LLM didn't generate content
+                    ai_response = first_tool_response
             
-            # If showing available slots
-            elif appointment_data and appointment_data.get('action') == 'show_slots':
-                slots = self.generate_available_slots()
-                appointment_data['slots'] = slots[:10]  # Return top 10 slots
-                
-                # Format slots in response
-                slots_text = "\n\n📅 **Available Appointments:**\n"
-                for i, slot in enumerate(slots[:10], 1):
-                    slots_text += f"{i}. {slot['formatted']}\n"
-                
-                ai_response = re.sub(r'\{[\s\S]*\}', '', ai_response).strip()
-                if not ai_response:
-                    ai_response = "Here are the available appointment slots:"
-                ai_response += slots_text
+            # If no tool was called and no response, generate a helpful response
+            if not ai_response:
+                ai_response = "I'm here to help you with appointments. You can search for doctors, book appointments, view your appointments, or cancel/reschedule existing ones. What would you like to do?"
             
             return ai_response, appointment_data
             
         except Exception as e:
             error_message = f"I apologize, but I encountered an error while processing your appointment request: {str(e)}"
+            import traceback
+            traceback.print_exc()
             return error_message, {"error": str(e), "success": False}
     
     def format_appointment_confirmation(self, appointment: Appointment) -> str:
@@ -769,4 +884,3 @@ You'll receive a reminder 24 hours before your appointment. If you need to resch
 📝 **Reason:** {appointment.reason}
 
 We'll send you a reminder 24 hours before your appointment. See you then!"""
-

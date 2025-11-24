@@ -13,7 +13,7 @@ from app.models.chat_conversation import ChatConversation
 from app.models.chat_message import ChatMessage
 from app.models.appointment import Appointment
 from app.agents.appointment_agent import AppointmentAgent
-from app.agents.qna_agent import QnaAgent
+# from app.agents.qna_agent import QnaAgent  # Temporarily disabled
 from app.agents.routing_agent import RoutingAgent
 
 router = APIRouter()
@@ -44,23 +44,17 @@ Remember: You are an assistant that provides information and guidance, but not m
 openai_client = None
 appointment_agent = None
 routing_agent = None
-qna_agent = None
+# qna_agent = None  # Temporarily disabled
 if settings.OPENAI_API_KEY:
     openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
     
-    # Initialize QnA agent first (with RAG if enabled)
     print(f"🔧 Initializing agents...")
-    print(f"   RAG_ENABLED: {settings.RAG_ENABLED}")
-    print(f"   PINECONE_API_KEY present: {bool(settings.PINECONE_API_KEY)}")
     
-    qna_agent = QnaAgent(openai_client, use_rag=settings.RAG_ENABLED)
-    print(f"✅ QnA Agent initialized (use_rag={settings.RAG_ENABLED})")
+    # Initialize routing agent
+    routing_agent = RoutingAgent(openai_client)
+    print(f"✅ Routing Agent initialized")
     
-    # Initialize routing agent with QnA agent (routing agent coordinates information flow)
-    routing_agent = RoutingAgent(openai_client, qna_agent=qna_agent)
-    print(f"✅ Routing Agent initialized with QnA Agent")
-    
-    # Initialize appointment agent (receives context from routing agent)
+    # Initialize appointment agent
     appointment_agent = AppointmentAgent(openai_client)
     print(f"✅ Appointment Agent initialized")
 
@@ -142,27 +136,16 @@ async def chat(
         appointment_data = None
         
         if target_service == "appointment_service" and appointment_agent:
-            # Get context from routing agent (which queries QnA agent with RAG)
-            print("🔄 Getting appointment context from Routing Agent...")
-            context = routing_agent.get_appointment_context() if routing_agent else None
-            print(f"✅ Context received: {list(context.keys()) if context else 'None'}")
-            
-            appointment_intent = appointment_agent.detect_appointment_intent(user_message)
+            # Appointment agent now queries Provider database directly
             ai_response, appointment_data = await appointment_agent.process_appointment_request(
                 message=user_message,
                 conversation_history=conversation_history,
                 patient_id=patient_id,
-                db=db,
-                intent=appointment_intent,
-                context=context
-            )
-        elif target_service == "qna_service" and qna_agent:
-            ai_response = qna_agent.generate_response(
-                user_message=user_message,
-                conversation_history=conversation_history
+                db=db
             )
         else:
-            # Use general medical assistant fallback
+            # Use general medical assistant fallback for all non-appointment requests
+            # (QnA service is temporarily disabled, so all Q&A goes to general fallback)
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(conversation_history)
             messages.append({"role": "user", "content": user_message})

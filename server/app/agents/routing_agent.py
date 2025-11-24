@@ -26,7 +26,7 @@ No extra text before or after the JSON.
 Schema (exact keys and types):
 {
   "schema_version": "1.0",            // string
-  "intent": "scheduling|q&a|user_decision",  // string, one of these, lowercase
+  "intent": "scheduling|qna|user_decision",  // string, one of these, lowercase
   "confidence": 0.0,                  // number in [0,1]
   "rationale": "short reason",        // string, ≤ 20 words
   "counts": {"scheduling": 0, "qna": 0},  // object with two integers (0 or positive)
@@ -37,14 +37,28 @@ Schema (exact keys and types):
 
 Rules:
 - Be deterministic and concise. Temperature is 0.
-- If the message clearly asks to book/change/cancel an appointment: intent = "scheduling".
-- If the message asks for general info/policy/medication/hours: intent = "q&a".
+- SCHEDULING intent (patient needs to see a doctor):
+  * Explicitly requests to book/change/cancel an appointment
+  * Reports symptoms or health problems (headache, pain, fever, illness, injury)
+  * Expresses health concerns requiring medical attention ("I have...", "I feel...", "experiencing...")
+  * Examples: "I have a headache", "My back hurts", "I'm feeling sick", "I need to see a doctor"
+
+- Q&A intent (seeking information, no appointment needed):
+  * Asks for general medical information or advice
+  * Questions about medications, drug interactions, dosages
+  * Policy/insurance/billing questions
+  * Operating hours, location, general facility information
+  * Examples: "Can I take antibiotic with alcohol?", "What are the side effects of aspirin?", "What are your hours?"
+
 - If votes tie or unclear: intent = "user_decision".
+
+Key distinction: Symptoms/health problems → scheduling | Information/advice questions → q&a
 """
 
 
 DEFAULT_INTENT_KEYWORDS: Dict[str, List[str]] = {
     "Scheduling": [
+        # Appointment-related keywords
         "schedule",
         "appointment",
         "book",
@@ -67,34 +81,123 @@ DEFAULT_INTENT_KEYWORDS: Dict[str, List[str]] = {
         "see a doctor",
         "follow-up",
         "check-in",
+        "consultation",
+        "consult",
+        # Symptom keywords that indicate need to see a doctor
+        "headache",
+        "pain",
+        "hurt",
+        "hurting",
+        "ache",
+        "aching",
+        "fever",
+        "sick",
+        "ill",
+        "dizzy",
+        "nausea",
+        "vomiting",
+        "cough",
+        "cold",
+        "flu",
+        "sore throat",
+        "swelling",
+        "rash",
+        "bleeding",
+        "injury",
+        "injured",
+        "broken",
+        "sprain",
+        "chest pain",
+        "shortness of breath",
+        "breathing problem",
+        "stomach ache",
+        "back pain",
+        "migraine",
+        "fatigue",
+        "tired",
+        "weakness",
+        "infection",
+        "allergic",
+        "allergy",
+        "emergency",
+        "urgent",
+        # Health concerns requiring medical attention
+        "i have",
+        "i feel",
+        "feeling",
+        "experiencing",
+        "suffering",
     ],
     "Q&A": [
+        # General information queries
         "question",
         "query",
         "general",
         "answer",
         "ask",
         "hours",
+        "operating hours",
+        "open",
+        "close",
+        # Question words for informational queries
         "how",
         "what",
         "which",
         "when",
+        "why",
+        "where",
+        "should i",
+        "can i",
+        "is it safe",
+        "is it okay",
+        # Medication and treatment information
         "side effect",
         "side effects",
         "dosage",
         "dose",
         "instruction",
+        "directions",
+        "medication",
+        "medicine",
+        "drug",
+        "prescription",
+        "over-the-counter",
+        "otc",
+        "antibiotic",
+        "antibiotics",
+        "painkiller",
+        "vitamin",
+        "supplement",
+        # Drug interactions and safety
+        "interaction",
+        "interact",
+        "mix",
+        "combine",
+        "together",
+        "with alcohol",
+        "alcohol",
+        "drinking",
+        # Administrative and policy queries
         "policy",
         "coverage",
         "benefit",
+        "insurance",
         "copay",
         "cost",
         "price",
+        "payment",
         "refill",
-        "medication",
-        "medicine",
-        "symptom",
         "faq",
+        # General medical information
+        "advice",
+        "recommend",
+        "recommendation",
+        "information",
+        "info",
+        "tell me about",
+        "explain",
+        "normal",
+        "common",
     ],
 }
 
@@ -132,14 +235,12 @@ class RoutingAgent:
         self,
         openai_client: Optional[OpenAI],
         *,
-        qna_agent=None,
         intent_map: Optional[Dict[str, List[str]]] = None,
         system_prompt: str = ROUTER_SYSTEM_PROMPT,
         router_model: str = "gpt-4o-mini",
         min_confidence_for_rules: float = 0.6,
     ) -> None:
         self.client = openai_client
-        self.qna_agent = qna_agent
         self.intent_map = intent_map or DEFAULT_INTENT_KEYWORDS
         self.system_prompt = system_prompt
         self.router_model = router_model
@@ -239,8 +340,14 @@ class RoutingAgent:
                 "raw_text": text,
             }
 
+        # Normalize intent: convert "q&a" to "qna" for consistency
+        intent = str(data.get("intent", "user_decision")).lower()
+        if intent == "q&a":
+            intent = "qna"
+        intent = intent.replace("&", "")  # Remove any remaining & characters
+
         return RoutingResult(
-            intent=str(data.get("intent", "user_decision")),
+            intent=intent,
             confidence=float(data.get("confidence", 0.5)),
             rationale=str(data.get("rationale", "")),
             counts=data.get("counts", {"scheduling": 0, "qna": 0}) or {"scheduling": 0, "qna": 0},
