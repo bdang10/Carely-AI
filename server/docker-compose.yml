@@ -16,7 +16,6 @@ services:
       - ./app:/app/app
       - ./alembic:/app/alembic
       - ./alembic.ini:/app/alembic.ini
-      - ./RAG:/app/RAG
     restart: unless-stopped
 
   # Note: Using Neon serverless Postgres (no local database needed)

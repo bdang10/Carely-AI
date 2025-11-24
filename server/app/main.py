@@ -1,4 +1,5 @@
 """Main FastAPI application"""
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -8,6 +9,18 @@ from app.api.v1.api import api_router
 from app.db.base import Base
 from app.db import base_all
 from app.db.session import engine
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO if settings.DEBUG else logging.WARNING,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Set specific loggers to INFO level for better visibility
+logging.getLogger("app.agents").setLevel(logging.INFO)
+logging.getLogger("app.service").setLevel(logging.INFO)
+logging.getLogger("app.api").setLevel(logging.INFO)
 
 # NOTE: Database migrations are now managed by Alembic
 # To create tables, run: alembic upgrade head

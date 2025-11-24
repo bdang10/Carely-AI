@@ -9,9 +9,13 @@ from openai import OpenAI
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 import json
+import logging
 
 from app.models.appointment import Appointment
 from app.models.provider import Provider
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class AppointmentAgent:
@@ -776,8 +780,8 @@ Appointment #{appointment.id} has been successfully updated.
                     function_name = tool_call.function.name
                     function_args = json.loads(tool_call.function.arguments)
                     
-                    print(f"🔧 Tool called: {function_name}")
-                    print(f"   Args: {function_args}")
+                    logger.info(f"🔧 Tool called: {function_name}")
+                    logger.debug(f"   Args: {function_args}")
                     
                     # Execute the appropriate tool
                     if function_name == "search_providers":

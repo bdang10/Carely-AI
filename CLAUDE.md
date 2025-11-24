@@ -112,43 +112,65 @@ npm run build
 
 ## Architecture
 
-### AI Agent System (Routing Agent as Coordinator)
+### AI Agent System (Decoupled Service Layer Architecture)
 
-The system uses a coordinator architecture where the **Routing Agent** orchestrates information flow:
+The system uses a clean, decoupled architecture where each agent has a single responsibility:
 
 ```
-User → Routing Agent (Coordinator)
-         ├─→ QnA Agent (with RAG) → Pinecone Vector DB
-         └─→ Appointment Agent (receives context from Routing Agent)
+User → Chat Endpoint
+         ↓
+    Routing Agent (Pure Intent Classifier)
+         ↓
+    ┌────┴────────┐
+    ↓             ↓
+QnA Agent    Appointment Agent
+    ↓
+RAG Service → Pinecone Vector DB
 ```
 
 **Key architectural points:**
 
 1. **Routing Agent** (`server/app/agents/routing_agent.py`):
-   - Classifies user intent as "scheduling" or "q&a" using hybrid keyword stemming + LLM verification
-   - Coordinates information flow between agents
-   - Queries QnA Agent (which has RAG) and passes information to Appointment Agent via `get_appointment_context()`
+   - Pure intent classifier - NO coordination logic
+   - Classifies user intent as "scheduling" or "qna" using hybrid keyword stemming + LLM verification
    - Uses NLTK PorterStemmer for keyword matching, falls back to OpenAI GPT-4o-mini when confidence < 0.6
+   - Returns routing decision with `next_service` (either "appointment_service" or "qna_service")
 
-2. **QnA Agent** (`server/app/agents/qna_agent.py`):
-   - Handles general medical Q&A
-   - Integrates with RAG (Retrieval-Augmented Generation) when enabled
-   - Provides doctor/schedule information to Routing Agent
-   - Uses Pinecone vector database for knowledge retrieval
+2. **RAG Service** (`server/app/service/rag_service.py`):
+   - Service layer for Pinecone vector database queries
+   - `query(query_text, top_k=3)` - Generates embeddings and retrieves relevant chunks
+   - `get_context_string()` - Formats chunks for LLM prompts
+   - Graceful fallback: Returns empty list on errors, logs warnings
+   - Configuration: Index "carely", Namespace "carely", Model "text-embedding-3-small"
 
-3. **Appointment Agent** (`server/app/agents/appointment_agent.py`):
+3. **QnA Agent** (`server/app/agents/qna_agent.py`):
+   - Handles general medical Q&A with optional RAG integration
+   - `generate_response(user_message, conversation_history)` - Main entry point
+   - Queries RAG service for relevant medical knowledge (if `use_rag=True`)
+   - Builds system prompt with RAG context and calls OpenAI GPT-4o-mini
+   - Graceful fallback: Continues without RAG context if service fails
+
+4. **Appointment Agent** (`server/app/agents/appointment_agent.py`):
    - Handles appointment booking, cancellation, rescheduling
-   - Receives doctor/schedule context from Routing Agent (not direct RAG access)
-   - Uses OpenAI GPT-4o-mini for natural language understanding
-   - Directly creates/updates database records
+   - Uses OpenAI GPT-4o-mini with function calling for natural language understanding
+   - Directly queries Provider database for doctor information
+   - Creates/updates database records independently (no RAG dependency)
+
+**Information flow for Q&A:**
+- User: "Can I take antibiotics with alcohol?"
+- Routing Agent: Classifies as "qna_service"
+- Chat Endpoint: Routes to QnA Agent
+- QnA Agent: Queries RAG Service for relevant medical FAQs
+- RAG Service: Returns top 3 relevant chunks from Pinecone
+- QnA Agent: Builds context and calls OpenAI with augmented prompt
+- Returns RAG-enhanced medical information
 
 **Information flow for appointments:**
 - User: "I need to see a cardiologist"
 - Routing Agent: Classifies as "appointment_service"
-- Routing Agent: Calls `get_appointment_context()` which queries QnA Agent (RAG)
-- QnA Agent: Returns doctor info from knowledge base
-- Routing Agent: Passes context to Appointment Agent
-- Appointment Agent: Uses context to book with real doctor information
+- Chat Endpoint: Routes to Appointment Agent
+- Appointment Agent: Uses function calling to search Provider database
+- Appointment Agent: Books appointment with real doctor information
 
 ### Backend Structure
 
@@ -159,17 +181,18 @@ User → Routing Agent (Coordinator)
 **Key modules:**
 - `app/api/v1/endpoints/` - API routes (auth, chat, patients, medical_records, etc.)
 - `app/agents/` - AI agents (routing, qna, appointment)
+- `app/service/` - Service layer (rag_service.py for Pinecone queries)
 - `app/models/` - SQLAlchemy database models
 - `app/schemas/` - Pydantic request/response schemas
 - `app/db/` - Database session and base configuration
-- `RAG/` - RAG implementation (Pinecone integration, PDF processing)
+- `app/rag/` - RAG utilities (insert_script.py for PDF processing and indexing)
 
 **Database:** Neon serverless Postgres (with connection pooling and Alembic migrations)
 
 **Chat endpoint flow** (`server/app/api/v1/endpoints/chat.py:68`):
-1. Routing Agent classifies intent
-2. If "appointment_service": Get context from Routing Agent → Appointment Agent
-3. If "qna_service": QnA Agent with RAG
+1. Routing Agent classifies intent (returns "appointment_service" or "qna_service")
+2. If "appointment_service": Route to Appointment Agent
+3. If "qna_service": Route to QnA Agent (queries RAG Service if enabled)
 4. Else: General medical assistant fallback
 5. Store messages in ChatMessage/ChatConversation models
 
@@ -189,26 +212,37 @@ User → Routing Agent (Coordinator)
 
 ### RAG System
 
-**Location:** `server/RAG/medical_rag.py`
+**Architecture:**
+- **RAG Service** (`server/app/service/rag_service.py`) - Query layer for retrieval
+- **Insert Script** (`server/app/rag/insert_script.py`) - PDF processing and indexing
 
 **How it works:**
-- PDF processing: Extracts and cleans text from medical PDFs
-- Chunking: Splits into 120-character wrapped chunks
-- Embeddings: OpenAI text-embedding-ada-002
-- Vector DB: Pinecone for similarity search
-- Retrieval: top_k=3 chunks for context augmentation
+
+**1. Indexing (one-time setup):**
+- PDF processing: Extracts and cleans text from medical PDFs in `server/app/rag/context/`
+- Chunking: Wraps text to 120 characters, splits into 9-line chunks with 3-line overlap
+- Embeddings: OpenAI text-embedding-3-small (1536 dimensions)
+- Vector DB: Pinecone (index: "carely", namespace: "carely")
+- Run: `python app/rag/insert_script.py`
+
+**2. Retrieval (runtime):**
+- RAG Service queries Pinecone with user question
+- Generates embedding for query text
+- Retrieves top_k=3 most relevant chunks
+- Returns text chunks to QnA Agent
 
 **Enable/Disable:**
 ```bash
 # In server/.env
 RAG_ENABLED=true  # Enable RAG
-PINECONE_API_KEY=your-key
+PINECONE_API_KEY=your-pinecone-key
 ```
 
 **QnA Agent RAG integration** (`server/app/agents/qna_agent.py`):
-- Initialized with `use_rag=True` when RAG_ENABLED
-- Retrieves relevant chunks before generating response
+- Initialized with `use_rag=settings.RAG_ENABLED` in chat.py
+- Calls `rag_service.get_context_string(user_message)` to retrieve relevant chunks
 - Augments system prompt with retrieved context
+- Graceful fallback: Continues without RAG if service fails
 
 ## Environment Configuration
 
@@ -316,27 +350,79 @@ alembic history
 ### Working with RAG
 
 **Add documents to knowledge base:**
-1. Place PDFs in `server/RAG/` directory
-2. Update `NUM_KNOWLEDGE_TXT` constant
-3. Run embedding process (see RAG setup in docs)
+1. Place PDFs in `server/app/rag/context/` directory
+2. Run indexing script: `cd server && python app/rag/insert_script.py`
+3. Script automatically processes all PDFs and upserts to Pinecone
 
-**Query RAG directly:**
+**Query RAG directly (for testing):**
 ```python
-from RAG.medical_rag import MedicalRAG
-rag = MedicalRAG(api_key=settings.PINECONE_API_KEY)
-results = rag.query("your question", top_k=3)
+from app.service.rag_service import RAGService
+from app.core.config import settings
+
+rag = RAGService(
+    pinecone_api_key=settings.PINECONE_API_KEY,
+    openai_api_key=settings.OPENAI_API_KEY
+)
+chunks = rag.query("your question", top_k=3)
+# Or get formatted context:
+context = rag.get_context_string("your question", top_k=3)
+```
+
+**Check RAG health:**
+```python
+health = rag.health_check()
+print(health)  # Shows index stats, vector counts, etc.
 ```
 
 ## Important Implementation Notes
 
 ### Agent Initialization Order
 
-Agents MUST be initialized in this order (see `server/app/api/v1/endpoints/chat.py:48`):
-1. QnA Agent (with RAG if enabled)
-2. Routing Agent (with qna_agent parameter)
-3. Appointment Agent (standalone)
+Agents are initialized in this order (see `server/app/api/v1/endpoints/chat.py:48`):
+1. QnA Agent (with `use_rag=settings.RAG_ENABLED`)
+2. Routing Agent (pure intent classifier, no dependencies)
+3. Appointment Agent (standalone, queries Provider database)
 
-This ensures proper dependency injection for the coordinator pattern.
+**Note:** The initialization order is flexible since agents are now decoupled. The Routing Agent no longer requires a reference to the QnA Agent.
+
+### Service Layer Pattern
+
+The RAG functionality is implemented as a **service layer** to promote separation of concerns:
+
+**Benefits:**
+- **Reusability:** RAG service can be used by any component (not just QnA agent)
+- **Testability:** Service can be unit tested independently
+- **Maintainability:** Pinecone logic isolated in one place
+- **Flexibility:** Easy to swap vector databases or add caching
+
+**Architecture:**
+```
+QnA Agent (business logic)
+    ↓ calls
+RAG Service (data access layer)
+    ↓ queries
+Pinecone Vector DB (data storage)
+```
+
+**Key principle:** Agents contain business logic (prompt building, LLM calls), services contain data access logic (database/API queries).
+
+### Graceful Degradation
+
+The system is designed to gracefully handle failures:
+
+**RAG Service failures:**
+- Returns empty list instead of throwing exceptions
+- Logs warnings but doesn't crash
+- QnA agent continues without context (falls back to general knowledge)
+
+**QnA Agent failures:**
+- Chat endpoint falls back to general medical assistant
+- User still gets a response (even if not RAG-enhanced)
+
+**Configuration flexibility:**
+- `RAG_ENABLED=false` - System works without RAG
+- Missing PINECONE_API_KEY - QnA agent disables RAG automatically
+- Missing PDFs in context/ - Insert script reports error gracefully
 
 ### Authentication
 
@@ -381,14 +467,39 @@ lsof -ti:5173 | xargs kill -9
 ```
 
 ### RAG not working
-- Verify `RAG_ENABLED=true` in server/.env
-- Check PINECONE_API_KEY is set
-- Look for "QnA agent initialized with RAG" in server logs
+
+**Check configuration:**
+```bash
+cd server
+grep RAG_ENABLED .env  # Should show: RAG_ENABLED=true
+grep PINECONE_API_KEY .env  # Should show your key
+```
+
+**Check server logs on startup:**
+```
+✅ RAG Service initialized - Index: carely, Namespace: carely
+✅ QnA Agent initialized (RAG: True)
+```
+
+**If RAG service fails to initialize:**
+- Check Pinecone API key is valid
+- Verify Pinecone index "carely" exists (run `python app/rag/insert_script.py`)
+- Check network connectivity to Pinecone
+
+**If no results returned:**
+- Verify PDFs have been indexed: Check Pinecone dashboard for vector count
+- Try test query: `rag.health_check()` should show namespace_vectors > 0
+- Check if query is too specific - try broader medical terms
+
+**Common issues:**
+- `⚠️ Failed to initialize RAG service` - API key invalid or network error
+- `⚠️ RAG query failed` - Pinecone connection issue (graceful fallback active)
+- Empty responses - No PDFs indexed or query doesn't match content
 
 ### Agent initialization errors
 - Ensure OpenAI API key is valid and has credits
-- Check agent initialization order (QnA → Routing → Appointment)
-- Verify NLTK data is downloaded
+- Agent initialization order is now flexible (agents are decoupled)
+- Verify NLTK data is downloaded for Routing Agent
 
 ### Database connection issues
 **"relation does not exist" errors:**
@@ -429,8 +540,3 @@ alembic downgrade -1   # Rollback if needed
 - Shadcn/ui (Radix UI + Tailwind)
 - React Router v6
 - React Query (TanStack Query)
-
-**Development:**
-- Python 3.11+
-- Node.js 16+
-- Neon Postgres (serverless, auto-scaling)

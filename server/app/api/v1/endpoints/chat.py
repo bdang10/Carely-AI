@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from openai import OpenAI
 import uuid
 import json
+import logging
 
 from app.core.config import settings
 from app.core.security import get_current_user
@@ -13,8 +14,11 @@ from app.models.chat_conversation import ChatConversation
 from app.models.chat_message import ChatMessage
 from app.models.appointment import Appointment
 from app.agents.appointment_agent import AppointmentAgent
-# from app.agents.qna_agent import QnaAgent  # Temporarily disabled
+from app.agents.qna_agent import QnaAgent
 from app.agents.routing_agent import RoutingAgent
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -44,19 +48,25 @@ Remember: You are an assistant that provides information and guidance, but not m
 openai_client = None
 appointment_agent = None
 routing_agent = None
-# qna_agent = None  # Temporarily disabled
+qna_agent = None
 if settings.OPENAI_API_KEY:
     openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
-    
-    print(f"🔧 Initializing agents...")
-    
-    # Initialize routing agent
+
+    logger.info("🔧 Initializing agents...")
+    logger.info(f"   RAG_ENABLED: {settings.RAG_ENABLED}")
+    logger.info(f"   PINECONE_API_KEY present: {bool(settings.PINECONE_API_KEY)}")
+
+    # Initialize QnA agent with RAG (if enabled)
+    qna_agent = QnaAgent(openai_client, use_rag=settings.RAG_ENABLED)
+    logger.info(f"✅ QnA Agent initialized (RAG: {settings.RAG_ENABLED})")
+
+    # Initialize routing agent (pure intent classifier)
     routing_agent = RoutingAgent(openai_client)
-    print(f"✅ Routing Agent initialized")
-    
+    logger.info("✅ Routing Agent initialized")
+
     # Initialize appointment agent
     appointment_agent = AppointmentAgent(openai_client)
-    print(f"✅ Appointment Agent initialized")
+    logger.info("✅ Appointment Agent initialized")
 
 
 @router.post("/", response_model=ChatMessageResponse, status_code=status.HTTP_200_OK)
@@ -131,25 +141,30 @@ async def chat(
         
         routing_decision = routing_agent.route_decision(user_message) if routing_agent else None
         target_service = routing_decision.get("next_service") if routing_decision else None
-        
+
         ai_response = ""
         appointment_data = None
-        
+
         if target_service == "appointment_service" and appointment_agent:
-            # Appointment agent now queries Provider database directly
+            # Route to appointment agent for scheduling
             ai_response, appointment_data = await appointment_agent.process_appointment_request(
                 message=user_message,
                 conversation_history=conversation_history,
                 patient_id=patient_id,
                 db=db
             )
+        elif target_service == "qna_service" and qna_agent:
+            # Route to QnA agent for medical questions (with RAG if enabled)
+            ai_response = qna_agent.generate_response(
+                user_message=user_message,
+                conversation_history=conversation_history
+            )
         else:
-            # Use general medical assistant fallback for all non-appointment requests
-            # (QnA service is temporarily disabled, so all Q&A goes to general fallback)
+            # Fallback for unclear intent or missing agents
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(conversation_history)
             messages.append({"role": "user", "content": user_message})
-            
+
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
