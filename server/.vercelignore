@@ -1,0 +1,24 @@
+# Python env & caches
+.venv
+env
+__pycache__
+*.pyc
+
+# Node stuff
+node_modules
+.npm
+.yarn
+.next
+
+# VCS
+.git
+.gitignore
+
+# Local data / models / artifacts
+data
+datasets
+models
+checkpoints
+logs
+uploads
+tmp
